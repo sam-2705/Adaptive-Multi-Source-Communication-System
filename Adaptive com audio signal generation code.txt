@@ -1,0 +1,289 @@
+clc; clear; close all;
+
+%% 🔹 1. Select audio file (NO PATH ISSUES)
+[file, path] = uigetfile({'*.wav;*.mp3'}, 'Select an audio file');
+
+if isequal(file,0)
+    disp("❌ No file selected");
+    return;
+end
+
+[x, Fs] = audioread(fullfile(path, file));
+
+%% 🔹 2. Convert to mono (if stereo)
+if size(x,2) > 1
+    x = mean(x,2);
+end
+
+x = x';   % row vector
+
+%% 🔹 3. Normalize signal
+x = x - mean(x);
+x = x / (max(abs(x)) + 1e-9);
+
+t = (0:length(x)-1)/Fs;
+
+%% 🔹 4. Choose carrier frequency
+fc = 400;   % Hz (audible carrier)
+
+%% 🔹 5. Modulation index
+mu = 0.7;   % keep between 0 and 1
+
+%% 🔹 6. AM modulation
+x_am = (1 + mu*x) .* cos(2*pi*fc*t);
+
+% Normalize again
+x_am = x_am / (max(abs(x_am)) + 1e-9);
+
+%% 🔹 7. Play signals
+disp("▶ Playing ORIGINAL audio...");
+sound(x, Fs);
+pause(length(x)/Fs + 1);
+
+disp("▶ Playing AM MODULATED audio...");
+sound(x_am, Fs);
+
+%% 🔹 8. Save output file
+output_file = fullfile(path, 'am_audio.wav');
+audiowrite(output_file, x_am, Fs);
+
+disp("✅ AM audio saved as:");
+disp(output_file);
+
+%% 🔹 9. Plot (optional)
+figure;
+subplot(2,1,1);
+plot(t, x);
+title("Original Audio");
+xlabel("Time (s)"); ylabel("Amplitude"); grid on;
+
+subplot(2,1,2);
+plot(t, x_am);
+title("AM Modulated Audio");
+xlabel("Time (s)"); ylabel("Amplitude"); grid on;
+
+clc; clear; close all;
+
+%% 🔹 1. Select audio file
+[file, path] = uigetfile({'*.wav;*.mp3'}, 'Select an audio file');
+
+if isequal(file,0)
+    disp("❌ No file selected");
+    return;
+end
+
+[x, Fs] = audioread(fullfile(path, file));
+
+%% 🔹 2. Convert to mono (if stereo)
+if size(x,2) > 1
+    x = mean(x,2);
+end
+
+x = x';   % row vector
+
+%% 🔹 3. Normalize
+x = x - mean(x);
+x = x / (max(abs(x)) + 1e-9);
+
+t = (0:length(x)-1)/Fs;
+
+%% 🔹 4. FM parameters
+fc = 400;   % carrier frequency (Hz) → keep audible (300–800)
+kf = 60;    % frequency sensitivity (try 30–100)
+
+%% 🔹 5. FM modulation
+x_fm = cos(2*pi*fc*t + kf*x);
+
+% Normalize again
+x_fm = x_fm / (max(abs(x_fm)) + 1e-9);
+
+%% 🔹 6. Play audio
+disp("▶ Playing ORIGINAL audio...");
+sound(x, Fs);
+pause(length(x)/Fs + 1);
+
+disp("▶ Playing FM MODULATED audio...");
+sound(x_fm, Fs);
+
+%% 🔹 7. Save FM file
+output_file = fullfile(path, 'fm_audio.wav');
+audiowrite(output_file, x_fm, Fs);
+
+disp("✅ FM audio saved as:");
+disp(output_file);
+
+%% 🔹 8. Plot (optional)
+figure;
+subplot(2,1,1);
+plot(t, x);
+title("Original Audio");
+xlabel("Time (s)"); ylabel("Amplitude"); grid on;
+
+subplot(2,1,2);
+plot(t, x_fm);
+title("FM Modulated Audio");
+xlabel("Time (s)"); ylabel("Amplitude"); grid on;
+
+clc; clear; close all;
+
+%% 🔹 Select your CLEAN audio file
+[file, path] = uigetfile({'*.wav;*.mp3'}, 'Select CLEAN audio');
+
+if isequal(file,0)
+    disp("❌ No file selected");
+    return;
+end
+
+[x, Fs] = audioread(fullfile(path, file));
+
+%% 🔹 Convert to mono
+if size(x,2) > 1
+    x = mean(x,2);
+end
+
+x = x(:);   % column
+
+%% 🔹 Normalize
+x = x / (max(abs(x)) + 1e-9);
+
+%% 🔹 Add noise
+noise_level = 0.2;   % 🔥 change this (0.1 low, 0.3 high)
+
+noise = noise_level * randn(size(x));
+
+x_noisy = x + noise;
+
+% Normalize again
+x_noisy = x_noisy / (max(abs(x_noisy)) + 1e-9);
+
+%% 🔹 Play
+disp("▶ Playing CLEAN audio...");
+sound(x, Fs);
+pause(length(x)/Fs + 1);
+
+disp("▶ Playing NOISY audio...");
+sound(x_noisy, Fs);
+
+%% 🔹 Save noisy file
+output_file = fullfile(path, 'noisy_audio.wav');
+audiowrite(output_file, x_noisy, Fs);
+
+disp("✅ Noisy audio saved at:");
+disp(output_file);
+
+clc; clear; close all;
+
+%% 🔹 Select CLEAN audio file
+[file, path] = uigetfile({'*.wav;*.mp3'}, 'Select CLEAN audio');
+
+if isequal(file,0)
+    disp("❌ No file selected");
+    return;
+end
+
+[x, Fs] = audioread(fullfile(path, file));
+
+%% 🔹 Convert to mono
+if size(x,2) > 1
+    x = mean(x,2);
+end
+
+x = x(:)';   % row vector
+
+%% 🔹 Normalize
+x = x - mean(x);
+x = x / (max(abs(x)) + 1e-9);
+
+t = (0:length(x)-1)/Fs;
+
+%% 🔹 AM parameters
+fc = 400;     % carrier frequency (Hz)
+mu = 0.7;     % modulation index
+
+%% 🔹 Create AM signal
+x_am = (1 + mu*x) .* cos(2*pi*fc*t);
+x_am = x_am / max(abs(x_am));
+
+%% 🔹 Add noise
+noise_level = 0.2;   % adjust (0.1 to 0.4)
+
+noise = noise_level * randn(size(x_am));
+
+x_am_noise = x_am + noise;
+
+% Normalize again
+x_am_noise = x_am_noise / (max(abs(x_am_noise)) + 1e-9);
+
+%% 🔹 Play audio
+disp("▶ Playing CLEAN audio...");
+sound(x, Fs);
+pause(length(x)/Fs + 1);
+
+disp("▶ Playing AM + NOISE audio...");
+sound(x_am_noise, Fs);
+
+%% 🔹 Save file
+output_file = fullfile(path, 'am_noise_audio.wav');
+audiowrite(output_file, x_am_noise, Fs);
+
+disp("✅ AM + Noise audio saved at:");
+disp(output_file);
+
+clc; clear; close all;
+
+%% 🔹 Select CLEAN audio file
+[file, path] = uigetfile({'*.wav;*.mp3'}, 'Select CLEAN audio');
+
+if isequal(file,0)
+    disp("❌ No file selected");
+    return;
+end
+
+[x, Fs] = audioread(fullfile(path, file));
+
+%% 🔹 Convert to mono
+if size(x,2) > 1
+    x = mean(x,2);
+end
+
+x = x(:)';   % row vector
+
+%% 🔹 Normalize
+x = x - mean(x);
+x = x / (max(abs(x)) + 1e-9);
+
+t = (0:length(x)-1)/Fs;
+
+%% 🔹 FM parameters
+fc = 400;   % carrier frequency (Hz)
+kf = 60;    % frequency sensitivity
+
+%% 🔹 Create FM signal
+x_fm = cos(2*pi*fc*t + kf*x);
+x_fm = x_fm / (max(abs(x_fm)) + 1e-9);
+
+%% 🔹 Add noise
+noise_level = 0.2;   % adjust (0.1 to 0.4)
+
+noise = noise_level * randn(size(x_fm));
+
+x_fm_noise = x_fm + noise;
+
+% Normalize again
+x_fm_noise = x_fm_noise / (max(abs(x_fm_noise)) + 1e-9);
+
+%% 🔹 Play audio
+disp("▶ Playing CLEAN audio...");
+sound(x, Fs);
+pause(length(x)/Fs + 1);
+
+disp("▶ Playing FM + NOISE audio...");
+sound(x_fm_noise, Fs);
+
+%% 🔹 Save file
+output_file = fullfile(path, 'fm_noise_audio.wav');
+audiowrite(output_file, x_fm_noise, Fs);
+
+disp("✅ FM + Noise audio saved at:");
+disp(output_file);
+

@@ -1,0 +1,1156 @@
+%% =========================================================================
+%%  ADAPTIVE COMMUNICATION SYSTEM — ESP32 SENSOR EDITION  v1.0
+%%
+%%  SENSORS USED:
+%%    GPIO 34 → POTENTIOMETER  (Clean signal / message m(t))
+%%    GPIO 35 → GAS SENSOR     (Noise source)
+%%    I2C     → MPU6050        (FM control via acceleration)
+%%
+%%  SIGNAL MODES (generated from sensor data):
+%%    1 — CLEAN SIGNAL     : Potentiometer only
+%%    2 — AM SIGNAL        : (1 + 0.8·pot) · cos(2π·fc·t)
+%%    3 — FM SIGNAL        : cos(2π·fc·t + kf·∫ax dt)
+%%    4 — AM + NOISE       : AM signal + 0.3·gas
+%%    5 — FM + NOISE       : FM signal + 0.3·gas
+%%    6 — PURE NOISE       : Gas sensor only
+%%
+%%  PIPELINE (12 STEPS):
+%%    1  Input Signal (ESP32 sensor data → derived signal)
+%%    2  Pre-Processing (Adaptive FIR filter + normalise)
+%%    3  Demodulation  (AM: coherent / FM: PLL / Clean: skip)
+%%    4  Message Extraction (LPF)
+%%    5  ADC  (Flash / SAR / Sigma-Delta)
+%%    6  Encoding (Parity or Hamming depending on SNR)
+%%    7  Digital Modulation (BPSK / QPSK / 16-QAM)
+%%    8  Channel  (AWGN)
+%%    9  RX Demodulation
+%%   10  Decoding + error correction
+%%   11  DAC reconstruction
+%%   12  Output + metrics
+%%
+%%  ARDUINO IDE CODE EXPECTED (115200 baud, CSV format):
+%%    Serial.print(pot);  Serial.print(",");
+%%    Serial.print(gas);  Serial.print(",");
+%%    Serial.println(ax);
+%%
+%%  NOTE: The IDE code sends three comma-separated integers per line.
+%%        Adjust COM_PORT below before running.
+%% =========================================================================
+
+clc; clear; close all;
+
+fprintf('\n');
+fprintf('  ╔══════════════════════════════════════════════════════════╗\n');
+fprintf('  ║   ADAPTIVE COMMUNICATION SYSTEM — ESP32 EDITION  v1.0   ║\n');
+fprintf('  ╚══════════════════════════════════════════════════════════╝\n\n');
+
+%% =========================================================================
+%%  CONFIGURATION  — edit these before running
+%% =========================================================================
+COM_PORT  = 'COM6';    % <-- change to your port (e.g. 'COM3', '/dev/ttyUSB0')
+BAUD      = 115200;
+N_SAMPLES = 500;       % samples to collect
+Fs        = 100;       % Hz  (matches delay(10) in Arduino = 100 Sa/s)
+FC        = 10;        % carrier frequency (Hz)
+FM_KFREQ  = 0.0002;   % FM deviation constant
+
+%% =========================================================================
+%%  STEP 1A — CONNECT & COLLECT SENSOR DATA
+%% =========================================================================
+fprintf('  ┌──────────────────────────────────────────────────────────┐\n');
+fprintf('  │  STEP 1 : CONNECTING TO ESP32 (%s @ %d baud)      \n', COM_PORT, BAUD);
+fprintf('  └──────────────────────────────────────────────────────────┘\n\n');
+
+pot_raw = zeros(1, N_SAMPLES);
+gas_raw = zeros(1, N_SAMPLES);
+ax_raw  = zeros(1, N_SAMPLES);
+
+try
+    sp = serialport(COM_PORT, BAUD, 'Timeout', 5);
+    configureTerminator(sp, 'LF');
+    flush(sp);
+    pause(1.0);   % let Arduino settle
+
+    fprintf('  [INFO] Flushing startup lines...\n');
+    for i = 1:20
+        try, readline(sp); catch, end
+    end
+
+    fprintf('  [REC]  Collecting %d samples... (%.1f s)\n\n', N_SAMPLES, N_SAMPLES/Fs);
+
+    k = 1;
+    fail_count = 0;
+    while k <= N_SAMPLES
+        try
+            ln = strtrim(char(readline(sp)));
+
+            % ── Accept BOTH plain CSV "pot,gas,ax"
+            %    AND labelled "POT:x,GAS:y,AX:z" from old firmware ──
+            if contains(ln, 'POT:')
+                tok = regexp(ln, ...
+                    'POT:(-?\d+),GAS:(-?\d+),AX:(-?\d+)', 'tokens','once');
+                if isempty(tok), continue; end
+                vals = str2double(tok);
+            else
+                vals = str2double(strsplit(ln, ','));
+                if numel(vals) < 3, continue; end
+            end
+
+            if any(isnan(vals(1:3))), continue; end
+
+            pot_raw(k) = vals(1);
+            gas_raw(k) = vals(2);
+            ax_raw(k)  = vals(3);
+            k = k + 1;
+            fail_count = 0;
+
+        catch
+            fail_count = fail_count + 1;
+            if fail_count > 200
+                warning('Too many read failures — truncating at %d samples.', k-1);
+                N_SAMPLES = k - 1;
+                pot_raw = pot_raw(1:N_SAMPLES);
+                gas_raw = gas_raw(1:N_SAMPLES);
+                ax_raw  = ax_raw(1:N_SAMPLES);
+                break;
+            end
+        end
+    end
+
+    delete(sp);
+    fprintf('  [OK]   Data collected: %d samples  (Fs=%d Hz, Dur=%.1f s)\n\n', ...
+            N_SAMPLES, Fs, N_SAMPLES/Fs);
+
+catch err
+    fprintf('\n  [WARN] Serial connection failed: %s\n', err.message);
+    fprintf('  [SIM]  Using SIMULATED sensor data for demo ...\n\n');
+
+    t_sim = (0:N_SAMPLES-1)/Fs;
+    pot_raw = round(2048 + 1800*sin(2*pi*0.5*t_sim) + 50*randn(1,N_SAMPLES));
+    gas_raw = round(1500 + 400*randn(1,N_SAMPLES) + 300*abs(sin(2*pi*0.2*t_sim)));
+    ax_raw  = round(8000*sin(2*pi*1.2*t_sim + 0.5) + 500*randn(1,N_SAMPLES));
+end
+
+%% =========================================================================
+%%  STEP 1B — NORMALISE RAW SENSORS
+%% =========================================================================
+norm_fn = @(x) 2*(double(x) - min(double(x))) ./ ...
+               (max(double(x)) - min(double(x)) + 1e-9) - 1;
+
+pot_n = norm_fn(pot_raw);   % Clean message signal  [-1, +1]
+gas_n = norm_fn(gas_raw);   % Noise signal          [-1, +1]
+ax_n  = norm_fn(ax_raw);    % FM control signal     [-1, +1]
+t     = (0:N_SAMPLES-1)/Fs;
+
+%% =========================================================================
+%%  STEP 1C — BUILD ALL 6 SIGNAL VARIANTS
+%% =========================================================================
+carrier = cos(2*pi*FC*t);
+
+sig_clean    = pot_n;
+sig_noise    = gas_n;
+sig_am       = (1 + 0.8*pot_n) .* carrier;
+sig_am       = sig_am / (max(abs(sig_am)) + 1e-9);
+fm_phase     = 2*pi*FC*t + FM_KFREQ * cumsum(ax_n);
+sig_fm       = cos(fm_phase);
+sig_am_noise = (sig_am + 0.3*gas_n);
+sig_am_noise = sig_am_noise / (max(abs(sig_am_noise)) + 1e-9);
+sig_fm_noise = (sig_fm + 0.3*gas_n);
+sig_fm_noise = sig_fm_noise / (max(abs(sig_fm_noise)) + 1e-9);
+
+%% =========================================================================
+%%  STEP 1D — PLOT RAW SENSOR DATA
+%% =========================================================================
+dark=[0.07 0.08 0.11]; mid=[0.13 0.14 0.19]; fg=[0.91 0.93 0.96];
+c1=[0.20 0.72 1.00]; c2=[1.00 0.58 0.10]; c3=[0.35 0.92 0.50];
+c4=[0.95 0.30 0.30]; c5=[0.75 0.40 1.00];
+
+fig_raw = figure('Name','ESP32 — Raw Sensor Data', ...
+    'NumberTitle','off','Color',dark,'Position',[20 500 900 400]);
+sgtitle('  RAW SENSOR SIGNALS (ESP32)', 'Color',c2, 'FontName','Courier New', ...
+    'FontWeight','bold','FontSize',11);
+
+ax_r1 = make_ax(subplot(3,1,1), mid, fg);
+plot(ax_r1, t, pot_raw, 'Color', c1, 'LineWidth', 1.2);
+set_labels(ax_r1, 'Time (s)', 'ADC Count', ...
+    sprintf('Potentiometer (GPIO 34) — Clean Source'), c1, fg);
+
+ax_r2 = make_ax(subplot(3,1,2), mid, fg);
+plot(ax_r2, t, gas_raw, 'Color', c4, 'LineWidth', 1.2);
+set_labels(ax_r2, 'Time (s)', 'ADC Count', ...
+    'Gas Sensor (GPIO 35) — Noise Source', c4, fg);
+
+ax_r3 = make_ax(subplot(3,1,3), mid, fg);
+plot(ax_r3, t, ax_raw, 'Color', c3, 'LineWidth', 1.2);
+set_labels(ax_r3, 'Time (s)', 'Raw Accel', ...
+    'MPU6050 AX — FM Control Signal', c3, fg);
+drawnow;
+
+%% =========================================================================
+%%  STEP 1E — USER SELECTS SIGNAL MODE
+%% =========================================================================
+fprintf('  ┌──────────────────────────────────────────────────────────┐\n');
+fprintf('  │  SELECT SIGNAL TO PROCESS                                │\n');
+fprintf('  │   1  —  CLEAN SIGNAL      (Potentiometer)               │\n');
+fprintf('  │   2  —  AM SIGNAL         (POT modulates carrier)       │\n');
+fprintf('  │   3  —  FM SIGNAL         (MPU controls frequency)      │\n');
+fprintf('  │   4  —  AM + NOISE        (AM corrupted by Gas sensor)  │\n');
+fprintf('  │   5  —  FM + NOISE        (FM corrupted by Gas sensor)  │\n');
+fprintf('  │   6  —  PURE NOISE        (Gas sensor only)             │\n');
+fprintf('  └──────────────────────────────────────────────────────────┘\n');
+sig_choice = safe_input('  Enter 1–6 : ', 1:6);
+
+switch sig_choice
+    case 1
+        signal    = sig_clean;
+        sig_label = 'Clean Signal (Pot)';
+        sig_class = 'Clean Signal';
+    case 2
+        signal    = sig_am;
+        sig_label = 'AM Signal (Pot × Carrier)';
+        sig_class = 'AM Signal';
+    case 3
+        signal    = sig_fm;
+        sig_label = 'FM Signal (MPU → freq)';
+        sig_class = 'FM Signal';
+    case 4
+        signal    = sig_am_noise;
+        sig_label = 'AM + Noise (Gas corruption)';
+        sig_class = 'AM + Noise';
+    case 5
+        signal    = sig_fm_noise;
+        sig_label = 'FM + Noise (Gas corruption)';
+        sig_class = 'FM + Noise';
+    case 6
+        signal    = sig_noise;
+        sig_label = 'Pure Noise (Gas Sensor)';
+        sig_class = 'Pure Noise';
+end
+
+signal = signal(:)';
+N      = numel(signal);
+signal = signal / (max(abs(signal)) + 1e-9);   % final normalise
+
+fprintf('\n  [OK] Working with: %s  (%d samples, Fs=%d Hz)\n\n', ...
+        sig_label, N, Fs);
+
+%% =========================================================================
+%%  COMPUTE SIGNAL FEATURES  (for report)
+%% =========================================================================
+[fc_est, env_var_v, freq_var_v, noise_lvl_v, raw_snr_dB] = ...
+    compute_features(signal, Fs);
+
+peak_amp = max(abs(signal));
+rms_amp  = rms(signal);
+sig_mean = mean(signal);
+sig_std  = std(signal);
+
+zc_flags           = (signal(1:end-1).*signal(2:end)) < 0;
+num_zero_crossings = sum(zc_flags);
+est_freq_zc        = num_zero_crossings / (2 * N/Fs);
+
+mag_spec  = abs(fft(signal)).^2;
+mag_half  = mag_spec(1:floor(N/2));
+sf_geom   = exp(mean(log(mag_half + 1e-15)));
+sf_arith  = mean(mag_half) + 1e-12;
+spec_flat = sf_geom / sf_arith;
+
+wlen_q    = max(3, round(N/50));
+smooth_q  = movmean(signal, wlen_q);
+mse_smooth = mean((signal - smooth_q).^2);
+
+pk_thresh   = 0.1 * peak_amp;
+is_pk_pos   = [false, signal(2:end-1)>signal(1:end-2) & ...
+               signal(2:end-1)>signal(3:end) & signal(2:end-1)>pk_thresh, false];
+is_pk_neg   = [false, signal(2:end-1)<signal(1:end-2) & ...
+               signal(2:end-1)<signal(3:end) & signal(2:end-1)<-pk_thresh, false];
+pks_pos = signal(is_pk_pos);
+pks_neg = signal(is_pk_neg);
+
+%% =========================================================================
+%%  ADAPTIVE PIPELINE PREVIEW LABELS
+%% =========================================================================
+switch sig_class
+    case {'AM Signal','FM Signal'}
+        bw_prev = max(fc_est*0.25, 5);
+        preview_filt = sprintf('BPF %.0f–%.0f Hz', ...
+            max(1,fc_est-bw_prev), min(Fs/2-1,fc_est+bw_prev));
+    case {'AM + Noise','FM + Noise'}
+        bw_prev = max(fc_est*0.2, 4);
+        preview_filt = sprintf('BPF tight %.0f–%.0f Hz', ...
+            max(1,fc_est-bw_prev), min(Fs/2-1,fc_est+bw_prev));
+    case 'Pure Noise'
+        preview_filt = sprintf('LPF aggressive %.0f Hz', Fs/8);
+    otherwise   % Clean Signal
+        preview_filt = sprintf('LPF %.0f Hz (anti-alias)', Fs/4);
+end
+
+switch sig_class
+    case {'AM Signal','AM + Noise'}, preview_demod = 'AM Coherent Detection';
+    case {'FM Signal','FM + Noise'}, preview_demod = 'FM PLL Demodulator';
+    otherwise,                       preview_demod = 'Skipped (baseband)';
+end
+
+preview_adc = 'SAR ADC (12-bit)';   % ESP32 has 12-bit SAR
+
+%% =========================================================================
+%%  PRINT FULL ANALYSIS REPORT
+%% =========================================================================
+fprintf('  ╔══════════════════════════════════════════════════════════╗\n');
+fprintf('  ║           INPUT SIGNAL ANALYSIS REPORT                   ║\n');
+fprintf('  ╚══════════════════════════════════════════════════════════╝\n');
+
+fprintf('\n  ┌─── SIGNAL IDENTIFICATION ──────────────────────────────┐\n');
+fprintf('  │  Signal Mode         : %-30s │\n', sig_label);
+fprintf('  │  Classified As       : %-30s │\n', sig_class);
+fprintf('  │  Est. Carrier Freq   : %-30s │\n', sprintf('%.2f Hz', fc_est));
+fprintf('  └────────────────────────────────────────────────────────┘\n');
+
+fprintf('\n  ┌─── TIME DOMAIN ────────────────────────────────────────┐\n');
+fprintf('  │  Samples             : %-30d │\n', N);
+fprintf('  │  Sample Rate         : %-30s │\n', sprintf('%d Hz', Fs));
+fprintf('  │  Duration            : %-30s │\n', sprintf('%.2f s', N/Fs));
+fprintf('  │  Peak Amplitude      : %-30s │\n', sprintf('%.4f', peak_amp));
+fprintf('  │  RMS Amplitude       : %-30s │\n', sprintf('%.4f', rms_amp));
+fprintf('  │  Mean                : %-30s │\n', sprintf('%.6f', sig_mean));
+fprintf('  │  Std Deviation       : %-30s │\n', sprintf('%.4f', sig_std));
+fprintf('  │  Zero Crossings      : %-30s │\n', sprintf('%d  (~%.1f Hz)', num_zero_crossings, est_freq_zc));
+fprintf('  │  Positive Peaks      : %-30d │\n', numel(pks_pos));
+fprintf('  │  Negative Peaks      : %-30d │\n', numel(pks_neg));
+fprintf('  └────────────────────────────────────────────────────────┘\n');
+
+fprintf('\n  ┌─── FREQUENCY DOMAIN ───────────────────────────────────┐\n');
+fprintf('  │  Est. Carrier Freq   : %-30s │\n', sprintf('%.2f Hz', fc_est));
+fprintf('  │  Spectral Flatness   : %-30s │\n', sprintf('%.4f  (0=tonal,1=noise)', spec_flat));
+fprintf('  │  Envelope Variance   : %-30s │\n', sprintf('%.4f', env_var_v));
+fprintf('  │  Frequency Spread    : %-30s │\n', sprintf('%.4f', freq_var_v));
+fprintf('  └────────────────────────────────────────────────────────┘\n');
+
+fprintf('\n  ┌─── SIGNAL QUALITY ─────────────────────────────────────┐\n');
+fprintf('  │  Estimated SNR       : %-30s │\n', sprintf('%.2f dB', raw_snr_dB));
+fprintf('  │  Noise Level (flat)  : %-30s │\n', sprintf('%.4f', noise_lvl_v));
+fprintf('  │  Smoothing MSE       : %-30s │\n', sprintf('%.6f', mse_smooth));
+fprintf('  └────────────────────────────────────────────────────────┘\n');
+
+fprintf('\n  ┌─── ADAPTIVE PIPELINE PREVIEW ──────────────────────────┐\n');
+fprintf('  │  Filter              : %-30s │\n', preview_filt);
+fprintf('  │  Demodulation        : %-30s │\n', preview_demod);
+fprintf('  │  ADC                 : %-30s │\n', preview_adc);
+fprintf('  └────────────────────────────────────────────────────────┘\n\n');
+
+%% =========================================================================
+%%  SNR INPUT → selects modulation
+%% =========================================================================
+fprintf('  ╔══════════════════════════════════════════════════════════╗\n');
+fprintf('  ║  CHANNEL SNR SETTING                                      ║\n');
+fprintf('  ║   < 8 dB  →  BPSK    |  8–15 dB →  QPSK                ║\n');
+fprintf('  ║   > 15 dB →  16-QAM                                      ║\n');
+fprintf('  ╚══════════════════════════════════════════════════════════╝\n');
+operating_snr_dB = safe_input_num('  Enter channel SNR in dB [12] : ', 12, -5, 40);
+
+if operating_snr_dB < 8
+    preview_enc   = 'Hamming(7,4) — 1-bit correct';
+    preview_digmod = 'BPSK  (SNR < 8 dB)';
+else
+    preview_enc = 'Even Parity (8,9)';
+    if operating_snr_dB <= 15
+        preview_digmod = 'QPSK  (SNR 8–15 dB)';
+    else
+        preview_digmod = '16-QAM  (SNR > 15 dB)';
+    end
+end
+
+fprintf('\n  ┌─── DIGITAL PIPELINE (post-SNR) ────────────────────────┐\n');
+fprintf('  │  SNR                 : %-30s │\n', sprintf('%.1f dB', operating_snr_dB));
+fprintf('  │  Encoding            : %-30s │\n', preview_enc);
+fprintf('  │  Digital Modulation  : %-30s │\n', preview_digmod);
+fprintf('  └────────────────────────────────────────────────────────┘\n\n');
+
+%% =========================================================================
+%%  STEP 2 — ADAPTIVE FILTER
+%% =========================================================================
+fprintf('  ── STEP 2 : Adaptive Filter ─────────────────────────\n');
+signal_raw = signal;
+
+switch sig_class
+    case {'AM Signal','FM Signal'}
+        bw = max(fc_est*0.25, 5);
+        [signal_filt, filt_label] = fir_filter(signal, Fs, 3, ...
+            max(1, fc_est-bw), min(Fs/2-1, fc_est+bw));
+        filt_label = sprintf('BPF %.0f–%.0f Hz', max(1,fc_est-bw), min(Fs/2-1,fc_est+bw));
+
+    case {'AM + Noise','FM + Noise'}
+        bw = max(fc_est*0.20, 4);
+        [signal_filt, filt_label] = fir_filter(signal, Fs, 3, ...
+            max(1, fc_est-bw), min(Fs/2-1, fc_est+bw));
+        filt_label = sprintf('BPF tight %.0f–%.0f Hz', max(1,fc_est-bw), min(Fs/2-1,fc_est+bw));
+
+    case 'Pure Noise'
+        [signal_filt, filt_label] = fir_filter(signal, Fs, 1, Fs/8, 0);
+        filt_label = sprintf('LPF aggressive %.0f Hz', Fs/8);
+
+    otherwise   % Clean Signal
+        [signal_filt, filt_label] = fir_filter(signal, Fs, 1, Fs/4, 0);
+        filt_label = sprintf('LPF %.0f Hz (anti-alias)', Fs/4);
+end
+
+pk = max(abs(signal_filt));
+if pk > 0, signal_filt = signal_filt / pk; end
+signal = signal_filt;
+fprintf('  [AUTO] Filter     : %s\n', filt_label);
+
+%% =========================================================================
+%%  STEP 3 — ADAPTIVE DEMODULATION
+%% =========================================================================
+fprintf('\n  ── STEP 3 : Adaptive Demodulation ──────────────────\n');
+
+switch sig_class
+    case {'AM Signal','AM + Noise'}
+        [msg_signal, demod_label] = demod_coherent(signal, Fs, fc_est);
+    case {'FM Signal','FM + Noise'}
+        [msg_signal, demod_label] = demod_pll_auto(signal, Fs, fc_est);
+    otherwise
+        msg_signal  = signal;
+        demod_label = 'Skipped (baseband already)';
+end
+fprintf('  [AUTO] Demod      : %s\n', demod_label);
+
+%% =========================================================================
+%%  STEP 4 — MESSAGE SIGNAL EXTRACTION
+%% =========================================================================
+msg_cutoff = min(Fs/4, 20);   % keep message band (slow sensor signals)
+[msg_signal, ~] = fir_filter(msg_signal, Fs, 1, msg_cutoff, 0);
+pk = max(abs(msg_signal)); if pk>0, msg_signal = msg_signal/pk; end
+fprintf('\n  [AUTO] Msg Extract: LPF @ %.0f Hz\n', msg_cutoff);
+
+%% =========================================================================
+%%  STEP 5 — ADC  (SAR 12-bit — matches ESP32 hardware)
+%% =========================================================================
+fprintf('\n  ── STEP 5 : Adaptive ADC ────────────────────────────\n');
+adc_bits  = 12;
+adc_label = 'SAR ADC (12-bit) — matches ESP32';
+[adc_codes, quant_signal] = adc_sar(msg_signal, adc_bits);
+fprintf('  [AUTO] ADC        : %s\n', adc_label);
+
+%% =========================================================================
+%%  STEP 6 — ENCODING
+%% =========================================================================
+fprintf('\n  ── STEP 6 : Adaptive Encoding ───────────────────────\n');
+bits_unified = quantize_to_bits(msg_signal, 8);
+
+if operating_snr_dB < 8
+    enc_method = 2;
+    [bits_enc, enc_label, enc_params] = encode_hamming(bits_unified);
+else
+    enc_method = 1;
+    [bits_enc, enc_label, enc_params] = encode_parity(bits_unified);
+end
+fprintf('  [AUTO] Encode     : %s  (%d→%d bits)\n', enc_label, numel(bits_unified), numel(bits_enc));
+
+%% =========================================================================
+%%  STEP 7-9 — DIGITAL MOD → CHANNEL → RX DEMOD
+%% =========================================================================
+fprintf('  ── STEP 7-9 : DigMod → AWGN Channel → RX Demod ────\n');
+[mod_label, tx_syms, rx_syms] = adaptive_modulate(bits_enc, operating_snr_dB);
+snr_measured = compute_snr(tx_syms, rx_syms);
+fprintf('  [AUTO] DigMod     : %s\n', strtrim(mod_label));
+
+%% =========================================================================
+%%  STEP 10 — DECODE
+%% =========================================================================
+fprintf('\n  ── STEP 10 : Adaptive Decoding ──────────────────────\n');
+if contains(mod_label,'BPSK'),     rx_bits = demod_bpsk(rx_syms);
+elseif contains(mod_label,'QPSK'),rx_bits = demod_qpsk(rx_syms);
+else,                              rx_bits = demod_16qam(rx_syms);
+end
+rx_bits = rx_bits(1:min(end, numel(bits_enc)));
+
+if enc_method == 2
+    [bits_dec, dec_label, n_errs] = decode_hamming(rx_bits, enc_params, numel(bits_unified));
+else
+    [bits_dec, dec_label, n_errs] = decode_parity(rx_bits, enc_params, numel(bits_unified));
+end
+fprintf('  [AUTO] Decode     : %s  |  Errors corrected: %d\n', dec_label, n_errs);
+
+%% =========================================================================
+%%  CLOSED FEEDBACK LOOP
+%% =========================================================================
+fprintf('\n  ── FEEDBACK LOOP ────────────────────────────────────\n');
+nb_cmp     = min(numel(bits_unified), numel(bits_dec));
+ber_live   = sum(bits_unified(1:nb_cmp) ~= bits_dec(1:nb_cmp)) / max(nb_cmp,1);
+BER_THRESH = 1e-2;
+MAX_RETX   = 3;
+retx_count = 0;
+
+fprintf('  Initial BER   : %.5f  (threshold = %.4f)\n', ber_live, BER_THRESH);
+
+while ber_live > BER_THRESH && retx_count < MAX_RETX
+    retx_count = retx_count + 1;
+
+    if contains(mod_label,'16-QAM')
+        new_snr = 12; fb_msg = 'BER too high → downgrade 16-QAM → QPSK';
+    elseif contains(mod_label,'QPSK')
+        new_snr = 5;  fb_msg = 'BER too high → downgrade QPSK → BPSK';
+    else
+        if enc_method ~= 2
+            enc_method = 2;
+            [bits_enc, enc_label, enc_params] = encode_hamming(bits_unified);
+        end
+        new_snr = operating_snr_dB;
+        fb_msg  = 'BER too high → BPSK + force Hamming(7,4)';
+    end
+
+    fprintf('  [FB %d] %s\n', retx_count, fb_msg);
+    [mod_label, tx_syms, rx_syms] = adaptive_modulate(bits_enc, new_snr);
+
+    if contains(mod_label,'BPSK'),     rx_bits = demod_bpsk(rx_syms);
+    elseif contains(mod_label,'QPSK'),rx_bits = demod_qpsk(rx_syms);
+    else,                              rx_bits = demod_16qam(rx_syms);
+    end
+    rx_bits = rx_bits(1:min(end, numel(bits_enc)));
+
+    if enc_method == 2
+        [bits_dec, dec_label, n_errs] = decode_hamming(rx_bits, enc_params, numel(bits_unified));
+    else
+        [bits_dec, dec_label, n_errs] = decode_parity(rx_bits, enc_params, numel(bits_unified));
+    end
+
+    nb_cmp   = min(numel(bits_unified), numel(bits_dec));
+    ber_live = sum(bits_unified(1:nb_cmp) ~= bits_dec(1:nb_cmp)) / max(nb_cmp,1);
+    fprintf('  [FB %d] New BER: %.5f  Mod: %s\n', retx_count, ber_live, strtrim(mod_label));
+    snr_measured = compute_snr(tx_syms, rx_syms);
+end
+
+if ber_live <= BER_THRESH
+    fprintf('  [FB] ✓ BER acceptable after %d retransmit(s)\n', retx_count);
+else
+    fprintf('  [FB] ⚠ BER still %.5f after %d retx — channel noisy\n', ber_live, retx_count);
+end
+
+%% =========================================================================
+%%  STEP 11 — DAC
+%% =========================================================================
+fprintf('\n  ── STEP 11 : DAC Reconstruction ─────────────────────\n');
+dac_label        = sprintf('Linear Interp DAC (8-bit, %d samples)', numel(msg_signal));
+recovered_signal = dac_reconstruct(bits_dec, 8, numel(msg_signal));
+[recovered_signal, ~] = fir_filter(recovered_signal, Fs, 1, msg_cutoff, 0);
+pk = max(abs(recovered_signal)); if pk>0, recovered_signal=recovered_signal/pk; end
+
+%% =========================================================================
+%%  STEP 12 — OUTPUT METRICS
+%% =========================================================================
+rec_snr = compute_snr_real(msg_signal, recovered_signal);
+
+fprintf('\n  ── STEP 12 : Output Signal ──────────────────────────\n');
+fprintf('  [OK] Recovery SNR : %.2f dB\n', rec_snr);
+fprintf('  [OK] Final BER    : %.5f\n',    ber_live);
+fprintf('  [OK] Retransmits  : %d\n',      retx_count);
+fprintf('  [OK] Final Mod    : %s\n',      strtrim(mod_label));
+
+%% =========================================================================
+%%  AUTO EXPORT TO EXCEL (ALL 5 SHEETS)
+%% =========================================================================
+
+% Create unique filename (so it doesn't overwrite every run)
+excel_file = ['Adaptive_Comm_Report_' datestr(now,'HHMMSS') '.xlsx'];
+
+fprintf('\n  ── EXPORTING DATA TO EXCEL ─────────────────────────────\n');
+
+%% =========================
+%% 🟢 SHEET 1 — INPUT SIGNAL ANALYSIS
+%% =========================
+Sheet1 = {
+    'Parameter', 'Value';
+    'Signal Type (Actual)', sig_class;
+    'Detected Type', sig_class;
+    'Sampling Frequency (Fs)', Fs;
+    'Duration (s)', N/Fs;
+    'Peak Amplitude', peak_amp;
+    'RMS', rms_amp;
+    'Mean', sig_mean;
+    'Std Dev', sig_std;
+    'Zero Crossings', num_zero_crossings;
+    'Estimated Frequency (Hz)', est_freq_zc
+};
+
+writecell(Sheet1, excel_file, 'Sheet', 'Input Analysis');
+
+
+%% =========================
+%% 🟡 SHEET 2 — FEATURE EXTRACTION
+%% =========================
+Sheet2 = {
+    'Parameter', 'Value';
+    'Envelope Variance (env_var)', env_var_v;
+    'Frequency Spread (freq_var)', freq_var_v;
+    'Spectral Flatness', spec_flat;
+    'Estimated SNR (dB)', raw_snr_dB
+};
+
+writecell(Sheet2, excel_file, 'Sheet', 'Feature Extraction');
+
+
+%% =========================
+%% 🔵 SHEET 3 — PIPELINE DECISIONS
+%% =========================
+Sheet3 = {
+    'Step', 'Output';
+    'Filter Used', filt_label;
+    'Demodulation Used', demod_label;
+    'ADC Type', adc_label;
+    'Encoding Method', enc_label;
+    'Digital Modulation', strtrim(mod_label)
+};
+
+writecell(Sheet3, excel_file, 'Sheet', 'Pipeline');
+
+
+%% =========================
+%% 🟣 SHEET 4 — CHANNEL PERFORMANCE
+%% =========================
+Sheet4 = {
+    'Parameter', 'Value';
+    'Input SNR (dB)', operating_snr_dB;
+    'Measured SNR (dB)', snr_measured;
+    'Bit Error Rate (BER)', ber_live;
+    'Errors Corrected', n_errs;
+    'Retransmissions', retx_count
+};
+
+writecell(Sheet4, excel_file, 'Sheet', 'Channel');
+
+
+%% =========================
+%% 🔴 SHEET 5 — OUTPUT QUALITY
+%% =========================
+mse_final = mean((msg_signal(1:nr) - recovered_signal(1:nr)).^2);
+
+Sheet5 = {
+    'Parameter', 'Value';
+    'Recovery SNR (dB)', rec_snr;
+    'Final BER', ber_live;
+    'Signal Error (MSE)', mse_final
+};
+
+writecell(Sheet5, excel_file, 'Sheet', 'Output Quality');
+
+
+fprintf('  [OK] Excel file created successfully: %s\n', excel_file);
+
+%% =========================================================================
+%%  FINAL PIPELINE SUMMARY TABLE
+%% =========================================================================
+fprintf('\n');
+fprintf('  ╔══════════════════════════════════════════════════════════╗\n');
+fprintf('  ║                 FINAL PIPELINE SUMMARY                   ║\n');
+fprintf('  ╚══════════════════════════════════════════════════════════╝\n');
+fprintf('  ┌──────────────┬──────────────────────┬────────────────────┐\n');
+fprintf('  │  STEP        │  STAGE               │  METHOD USED       │\n');
+fprintf('  ├──────────────┼──────────────────────┼────────────────────┤\n');
+fprintf('  │  1  Input    │  %-20s │  %-18s │\n', 'ESP32 Sensors',   sig_label(1:min(end,18)));
+fprintf('  │  2  Filter   │  %-20s │  %-18s │\n', 'Adaptive Filter', filt_label(1:min(end,18)));
+fprintf('  │  3  Demod    │  %-20s │  %-18s │\n', 'Demodulation',    demod_label(1:min(end,18)));
+fprintf('  │  4  Msg      │  %-20s │  %-18s │\n', 'Msg Extraction',  sprintf('LPF @%.0fHz',msg_cutoff));
+fprintf('  │  5  ADC      │  %-20s │  %-18s │\n', 'Analog→Digital',  adc_label(1:min(end,18)));
+fprintf('  │  6  Encode   │  %-20s │  %-18s │\n', 'Channel Encode',  enc_label(1:min(end,18)));
+fprintf('  │  7  Mod(TX)  │  %-20s │  %-18s │\n', 'Digital Mod',     strtrim(mod_label(1:min(end,18))));
+fprintf('  │  8  Channel  │  %-20s │  %-18s │\n', 'AWGN Channel',    sprintf('SNR=%.1fdB',operating_snr_dB));
+fprintf('  │  9  Demod RX │  %-20s │  %-18s │\n', 'RX Demodulation', strtrim(mod_label(1:min(end,18))));
+fprintf('  │  10 Decode   │  %-20s │  %-18s │\n', 'Channel Decode',  dec_label(1:min(end,18)));
+fprintf('  │  11 DAC      │  %-20s │  %-18s │\n', 'Digital→Analog',  'Linear Interp 8b');
+fprintf('  ├──────────────┴──────────────────────┴────────────────────┤\n');
+fprintf('  │  PERFORMANCE METRICS                                       │\n');
+fprintf('  ├────────────────────────────────────────────────────────────┤\n');
+fprintf('  │  Signal Mode           : %-32s │\n', sig_class);
+fprintf('  │  Source Label          : %-32s │\n', sig_label);
+fprintf('  │  Operating SNR         : %-32s │\n', sprintf('%.1f dB', operating_snr_dB));
+fprintf('  │  Measured TX SNR       : %-32s │\n', sprintf('%.2f dB', snr_measured));
+fprintf('  │  Recovery SNR          : %-32s │\n', sprintf('%.2f dB', rec_snr));
+fprintf('  │  Digital Mod Used      : %-32s │\n', strtrim(mod_label));
+fprintf('  │  Decoding Method       : %-32s │\n', dec_label);
+fprintf('  │  Final BER             : %-32s │\n', sprintf('%.5f', ber_live));
+fprintf('  │  Errors Corrected      : %-32s │\n', sprintf('%d', n_errs));
+fprintf('  │  Retransmissions       : %-32s │\n', sprintf('%d', retx_count));
+fprintf('  └────────────────────────────────────────────────────────────┘\n\n');
+
+%% =========================================================================
+%%  SUPPORTING DATA FOR PLOTS
+%% =========================================================================
+[psd_f, psd_p]             = manual_psd(signal, Fs);
+snr_vec                    = 0:2:20;
+[th_b,sim_b,th_q,sim_q,th_16,sim_16] = ber_sweep(snr_vec);
+Np = numel(tx_syms);
+t_msg = (0:numel(msg_signal)-1)/Fs;
+t_rec = (0:numel(recovered_signal)-1)/Fs;
+nr    = min(numel(msg_signal), numel(recovered_signal));
+
+%% =========================================================================
+%%  FIGURE 2 — DERIVED SIGNALS OVERVIEW
+%% =========================================================================
+fig_sig = figure('Name','ESP32 — Derived Signal Variants', ...
+    'NumberTitle','off','Color',dark,'Position',[20 80 900 520]);
+sgtitle('  DERIVED SIGNAL VARIANTS (from ESP32 sensors)', ...
+    'Color',c2,'FontName','Courier New','FontWeight','bold','FontSize',10);
+
+ax_d1 = make_ax(subplot(3,2,1), mid, fg);
+plot(ax_d1, t, sig_clean, 'Color', c1, 'LineWidth',1.1);
+set_labels(ax_d1,'Time (s)','Amp','CLEAN (Potentiometer)',c1,fg);
+
+ax_d2 = make_ax(subplot(3,2,2), mid, fg);
+plot(ax_d2, t, sig_noise, 'Color', c4, 'LineWidth',1.1);
+set_labels(ax_d2,'Time (s)','Amp','NOISE (Gas Sensor)',c4,fg);
+
+ax_d3 = make_ax(subplot(3,2,3), mid, fg);
+plot(ax_d3, t, sig_am, 'Color', c2, 'LineWidth',1.1);
+set_labels(ax_d3,'Time (s)','Amp','AM SIGNAL',c2,fg);
+
+ax_d4 = make_ax(subplot(3,2,4), mid, fg);
+plot(ax_d4, t, sig_fm, 'Color', c3, 'LineWidth',1.1);
+set_labels(ax_d4,'Time (s)','Amp','FM SIGNAL (MPU)',c3,fg);
+
+ax_d5 = make_ax(subplot(3,2,5), mid, fg);
+plot(ax_d5, t, sig_am_noise, 'Color', c5, 'LineWidth',1.1);
+set_labels(ax_d5,'Time (s)','Amp','AM + NOISE',c5,fg);
+
+ax_d6 = make_ax(subplot(3,2,6), mid, fg);
+plot(ax_d6, t, sig_fm_noise, 'Color',[0.9 0.9 0.3],'LineWidth',1.1);
+set_labels(ax_d6,'Time (s)','Amp','FM + NOISE',c4,fg);
+drawnow;
+
+%% =========================================================================
+%%  FIGURE 3 — 12-PANEL MAIN PIPELINE
+%% =========================================================================
+fig_main = figure('Name', sprintf('ESP32 Adaptive Comm v1.0 — %s', sig_label), ...
+    'NumberTitle','off','Color',dark,'Position',[950 30 1500 860]);
+
+annotation(fig_main,'textbox',[0 0.956 1 0.044], ...
+    'String', sprintf( ...
+    '  ESP32 v1.0  |  Mode: %s  |  Filter: %s  |  Demod: %s  |  ADC: %s  |  Enc: %s  |  Mod: %s  |  BER: %.5f', ...
+    sig_class, filt_label, demod_label, adc_label, enc_label, strtrim(mod_label), ber_live), ...
+    'FontSize',7.5,'FontWeight','bold','Color',c2, ...
+    'BackgroundColor',[0.04 0.04 0.07],'EdgeColor','none', ...
+    'HorizontalAlignment','left','VerticalAlignment','middle','FontName','Courier New');
+
+%  Panel 1 — Input signal
+p1 = make_ax(subplot(3,4,1), mid, fg);
+plot(p1, t, signal_raw, 'Color',c1,'LineWidth',1.3);
+set_labels(p1,'Time (s)','Amplitude', ...
+    sprintf('Step 1 — Input\n%s', sig_label),c1,fg);
+
+%  Panel 2 — Before/after filter
+p2 = make_ax(subplot(3,4,2), mid, fg);
+plot(p2,(0:N-1)/Fs, signal_raw,'Color',[c4 0.35],'LineWidth',0.8);
+hold(p2,'on');
+plot(p2,(0:numel(signal_filt)-1)/Fs, signal_filt,'Color',c1,'LineWidth',1.4);
+legend(p2,{'Raw','Filtered'},'TextColor',fg,'Color',mid,'EdgeColor',[0.3 0.3 0.4],'FontSize',7);
+set_labels(p2,'Time (s)','Amplitude', ...
+    sprintf('Step 2 — Filter\n%s',filt_label),c1,fg);
+
+%  Panel 3 — Demodulated
+p3 = make_ax(subplot(3,4,3), mid, fg);
+plot(p3, t_msg, msg_signal,'Color',c3,'LineWidth',1.3);
+set_labels(p3,'Time (s)','Amplitude', ...
+    sprintf('Step 3-4 — Demod\n%s',demod_label(1:min(end,26))),c3,fg);
+
+%  Panel 4 — Quantised ADC
+p4 = make_ax(subplot(3,4,4), mid, fg);
+stairs(p4, t_msg(1:numel(quant_signal)), quant_signal,'Color',c5,'LineWidth',1.2);
+hold(p4,'on');
+plot(p4, t_msg, msg_signal,'Color',[c1 0.4],'LineWidth',0.8);
+legend(p4,{'Quantised','Original'},'TextColor',fg,'Color',mid,'EdgeColor',[0.3 0.3 0.4],'FontSize',7);
+set_labels(p4,'Time (s)','Level', ...
+    sprintf('Step 5 — ADC\n%s',adc_label(1:min(end,24))),c5,fg);
+
+%  Panel 5 — Encoded bits
+p5 = make_ax(subplot(3,4,5), mid, fg);
+nb_show = min(128, numel(bits_enc));
+stem(p5, 1:nb_show, double(bits_enc(1:nb_show)),'Color',c3,'MarkerSize',2,'LineWidth',0.7);
+ylim(p5,[-0.2 1.4]);
+set_labels(p5,'Bit Index','Value', ...
+    sprintf('Step 6 — Encoded\n%s',enc_label),c3,fg);
+
+%  Panel 6 — TX Constellation
+p6 = make_ax(subplot(3,4,6), mid, fg);
+scatter(p6, real(tx_syms(1:Np)), imag(tx_syms(1:Np)), 40, c3, 'x','LineWidth',2);
+axis(p6,'equal');
+set_labels(p6,'I','Q', ...
+    sprintf('Step 7 — TX Constellation\n%s',strtrim(mod_label)),c3,fg);
+
+%  Panel 7 — Decoded bits (errors highlighted)
+p7 = make_ax(subplot(3,4,7), mid, fg);
+nb_cmp2 = min(128, min(numel(bits_unified), numel(bits_dec)));
+stem(p7, 1:nb_cmp2, double(bits_dec(1:nb_cmp2)),'Color',[c1 0.7],'MarkerSize',2,'LineWidth',0.7);
+hold(p7,'on');
+errs_plt = bits_unified(1:nb_cmp2) ~= bits_dec(1:nb_cmp2);
+ei = find(errs_plt);
+if ~isempty(ei)
+    stem(p7, ei, ones(1,numel(ei)),'Color',c4,'MarkerSize',5,'LineWidth',1.5);
+end
+set_labels(p7,'Bit Index','Value', ...
+    sprintf('Step 10 — Decoded\n%s (red=err)',dec_label),c1,fg);
+
+%  Panel 8 — DAC Output
+p8 = make_ax(subplot(3,4,8), mid, fg);
+plot(p8, t_msg(1:nr), msg_signal(1:nr),'Color',[c2 0.7],'LineWidth',0.9);
+hold(p8,'on');
+plot(p8, t_rec(1:nr), recovered_signal(1:nr),'Color',c3,'LineWidth',1.3);
+legend(p8,{'Message','Recovered'},'TextColor',fg,'Color',mid,'EdgeColor',[0.3 0.3 0.4],'FontSize',7);
+set_labels(p8,'Time (s)','Amplitude', ...
+    'Step 11 — DAC\nLinear Interp 8-bit',c3,fg);
+
+%  Panel 9 — Reconstruction error
+p9 = make_ax(subplot(3,4,9), mid, fg);
+err_sig = msg_signal(1:nr) - recovered_signal(1:nr);
+plot(p9, t_msg(1:nr), err_sig,'Color',c4,'LineWidth',1.0);
+yline(p9, 0,'--','Color',[fg 0.4],'LineWidth',0.8);
+set_labels(p9,'Time (s)','Error', ...
+    sprintf('Step 12 — Output Error\nRecov. SNR = %.2f dB',rec_snr),c4,fg);
+
+%  Panel 10 — PSD
+p10 = make_ax(subplot(3,4,10), mid, fg);
+semilogy(p10, psd_f, psd_p+1e-12,'Color',c1,'LineWidth',1.2);
+xline(p10, fc_est,'--','Color',c4,'LineWidth',1.2, ...
+    'Label',sprintf('fc=%.1fHz',fc_est),'LabelColor',c4,'FontSize',7,'FontName','Courier New');
+set_labels(p10,'Freq (Hz)','Power','PSD of Filtered Signal',c1,fg);
+
+%  Panel 11 — RX Constellation
+p11 = make_ax(subplot(3,4,11), mid, fg);
+scatter(p11, real(rx_syms(1:Np)), imag(rx_syms(1:Np)), 20,'yellow','filled');
+hold(p11,'on');
+scatter(p11, real(tx_syms(1:Np)), imag(tx_syms(1:Np)), 35, c3,'x','LineWidth',1.8);
+axis(p11,'equal'); xlim(p11,[-2 2]); ylim(p11,[-2 2]);
+legend(p11,{'RX','TX Ideal'},'TextColor',fg,'Color',mid,'EdgeColor',[0.3 0.3 0.4],'FontSize',7);
+set_labels(p11,'I','Q', ...
+    sprintf('Step 8-9 — Channel RX\nSNR = %.1f dB',operating_snr_dB),c1,fg);
+
+%  Panel 12 — BER Curves
+p12 = make_ax(subplot(3,4,12), mid, fg);
+set(p12,'YScale','log');
+semilogy(p12,snr_vec,th_b,'--','Color',c1,'LineWidth',1.6); hold(p12,'on');
+semilogy(p12,snr_vec,sim_b,'-o','Color',c1,'LineWidth',1.1,'MarkerSize',4,'MarkerFaceColor',c1);
+semilogy(p12,snr_vec,th_q,'--','Color',c2,'LineWidth',1.6);
+semilogy(p12,snr_vec,sim_q,'-s','Color',c2,'LineWidth',1.1,'MarkerSize',4,'MarkerFaceColor',c2);
+semilogy(p12,snr_vec,th_16,'--','Color',c3,'LineWidth',1.6);
+semilogy(p12,snr_vec,sim_16,'-^','Color',c3,'LineWidth',1.1,'MarkerSize',4,'MarkerFaceColor',c3);
+xline(p12,operating_snr_dB,':','Color',c4,'LineWidth',2.0, ...
+    'Label',sprintf('%.0fdB',operating_snr_dB),'LabelColor',c4,'FontSize',7.5,'FontName','Courier New');
+ylim(p12,[1e-6 1]); xlim(p12,[0 20]);
+legend(p12,{'BPSK-T','BPSK-S','QPSK-T','QPSK-S','QAM-T','QAM-S'}, ...
+    'TextColor',fg,'Color',mid,'EdgeColor',[0.3 0.3 0.4],'FontSize',6.5,'NumColumns',2,'Location','southwest');
+set_labels(p12,'Eb/N0 (dB)','BER', ...
+    sprintf('BER vs SNR\n%s  BER=%.5f',strtrim(mod_label),ber_live),c4,fg);
+
+drawnow;
+fprintf('  [DONE — ESP32 ADAPTIVE COMM v1.0 COMPLETE]\n\n');
+
+%% =========================================================================
+%%  HELPER FUNCTIONS
+%% =========================================================================
+
+function val = safe_input(prompt, valid_vals)
+    val = [];
+    while isempty(val) || ~ismember(val, valid_vals)
+        raw = input(prompt);
+        if isnumeric(raw) && isscalar(raw), val = round(raw); end
+        if ~ismember(val, valid_vals)
+            fprintf('  Invalid — choose: %s\n', num2str(valid_vals));
+        end
+    end
+end
+
+function val = safe_input_num(prompt, default, lo, hi)
+    raw = input(prompt);
+    if isempty(raw)||~isnumeric(raw)||raw<lo||raw>hi
+        val = default;
+    else
+        val = raw;
+    end
+end
+
+%% --- Feature extraction (no classification — user chose signal type) ---
+function [fc_est, env_var_out, freq_var_out, noise_lvl_out, snr_dB] = ...
+        compute_features(x, fs)
+    x   = x(:)' / (max(abs(x)) + 1e-12);
+    N   = numel(x);
+    X   = fft(x, N);
+    H   = zeros(1, N);
+    if mod(N,2)==0
+        H(1)=1; H(N/2+1)=1; H(2:N/2)=2;
+    else
+        H(1)=1; H(2:(N+1)/2)=2;
+    end
+    xa       = ifft(X .* H);
+    env      = abs(xa);
+    env_mean = mean(env);
+    env_var_out  = var(env) / (env_mean^2 + 1e-12);
+    iph      = unwrap(angle(xa));
+    dph      = diff(iph) * fs / (2*pi);
+    freq_var_out = std(dph) / (fs/2 + 1e-12);
+    Xmag     = abs(X(1:floor(N/2))).^2;
+    freqs    = (0:floor(N/2)-1) * (fs/N);
+    [~,pi_]  = max(Xmag(2:end)); pi_=pi_+1;
+    fc_est   = freqs(pi_);
+    peak_pow = Xmag(pi_);
+    med_pow  = median(Xmag) + 1e-12;
+    snr_dB   = 10*log10(peak_pow/med_pow);
+    sf_geom  = exp(mean(log(Xmag + 1e-15)));
+    sf_arith = mean(Xmag) + 1e-12;
+    noise_lvl_out = sf_geom / sf_arith;
+end
+
+%% --- FIR Filter ---
+function [y, label] = fir_filter(x, fs, ftype, fc_lo, fc_hi)
+    x = x(:)'; M = 64;
+    n = -M/2 : M/2;
+    Wc_lo = 2*fc_lo/fs; Wc_hi = 2*fc_hi/fs;
+    win  = 0.54 - 0.46*cos(2*pi*(n+M/2)/M);
+    mysinc = @(v) sin(pi*v + 1e-12) ./ (pi*v + 1e-12);
+    switch ftype
+        case 1
+            h = Wc_lo * mysinc(Wc_lo*n) .* win; label=sprintf('LPF %.0fHz',fc_lo);
+        case 2
+            h_lpf = Wc_lo*mysinc(Wc_lo*n).*win;
+            delta = [zeros(1,M/2) 1 zeros(1,M/2)]; h=delta-h_lpf; label=sprintf('HPF %.0fHz',fc_lo);
+        case 3
+            h = Wc_hi*mysinc(Wc_hi*n).*win - Wc_lo*mysinc(Wc_lo*n).*win;
+            label=sprintf('BPF %.0f-%.0fHz',fc_lo,fc_hi);
+        case 4
+            h_bpf=Wc_hi*mysinc(Wc_hi*n).*win-Wc_lo*mysinc(Wc_lo*n).*win;
+            delta=[zeros(1,M/2) 1 zeros(1,M/2)]; h=delta-h_bpf; label=sprintf('Notch %.0f-%.0fHz',fc_lo,fc_hi);
+        otherwise
+            h=[zeros(1,M/2) 1 zeros(1,M/2)]; label='Bypass';
+    end
+    h=h(:)'; Nx=numel(x); Nh=numel(h); Ny=Nx+Nh-1; y=zeros(1,Ny);
+    for k=1:Nh, y(k:k+Nx-1)=y(k:k+Nx-1)+h(k)*x; end
+    y=y(M/2+1:M/2+Nx);
+end
+
+%% --- AM Coherent Demodulation ---
+function [msg, label] = demod_coherent(x, fs, fc)
+    x  = x(:)'; N=numel(x); t_=(0:N-1)/fs;
+    X  = fft(x,N); H=zeros(1,N);
+    if mod(N,2)==0, H(1)=1;H(N/2+1)=1;H(2:N/2)=2; else, H(1)=1;H(2:(N+1)/2)=2; end
+    xa = ifft(X.*H);
+    phi = mean(unwrap(angle(xa)) - 2*pi*fc*t_);
+    ref = cos(2*pi*fc*t_ + phi);
+    mix = x .* ref;
+    [msg,~] = fir_filter(mix, fs, 1, fc*0.6, 0);
+    msg = 2*msg(:)'; label = 'AM Coherent Detection (Hilbert-assisted)';
+end
+
+%% --- FM PLL Demodulation ---
+function [msg, label] = demod_pll_auto(x, fs, fc)
+    x=x(:)'; N=numel(x); msg=zeros(1,N);
+    BW=max(fc/20,0.5); Kp=2*pi*BW/(fc+1e-12); Ki=Kp^2/4;
+    Kp=min(Kp,0.15); Ki=min(Ki,0.002);
+    phi=0; int_=0;
+    for i=1:N
+        vco_q  = -sin(2*pi*fc*(i-1)/fs + phi);
+        err    = x(i)*vco_q; int_=int_+Ki*err;
+        phi    = phi+Kp*err+int_; msg(i)=err;
+    end
+    [msg,~]=fir_filter(msg,fs,1,fc*0.5,0);
+    label=sprintf('FM PLL (Kp=%.4f Ki=%.6f BW=%.1fHz)',Kp,Ki,BW);
+end
+
+%% --- SAR ADC ---
+function [codes_norm, quant_sig] = adc_sar(x, nbits)
+    x=x(:)'; levels=2^nbits; x_n=min(max((x+1)/2,0),1);
+    codes=zeros(1,numel(x));
+    for i=1:numel(x)
+        g=0;
+        for b=nbits:-1:1
+            trial=g+2^(b-1);
+            if x_n(i)*(levels-1)>=trial, g=trial; end
+        end
+        codes(i)=g;
+    end
+    codes_norm=codes/(levels-1); quant_sig=codes_norm*2-1;
+end
+
+%% --- Parity Encoding ---
+function [bits_out,label,params] = encode_parity(bits_in)
+    bits_in=bits_in(:)';
+    pad=mod(8-mod(numel(bits_in),8),8);
+    b=[bits_in,zeros(1,pad,'int8')]; n_bytes=numel(b)/8;
+    bits_out=zeros(1,n_bytes*9,'int8');
+    for i=1:n_bytes
+        byte=b((i-1)*8+(1:8)); par=int8(mod(sum(double(byte)),2));
+        bits_out((i-1)*9+(1:9))=[byte par];
+    end
+    label='Even Parity (8,9)'; params=struct('method',1,'pad',pad);
+end
+
+%% --- Hamming(7,4) Encoding ---
+function [bits_out,label,params] = encode_hamming(bits_in)
+    bits_in=bits_in(:)'; pad=mod(4-mod(numel(bits_in),4),4);
+    b=[bits_in,zeros(1,pad,'int8')]; n4=numel(b)/4;
+    bits_out=zeros(1,n4*7,'int8');
+    for i=1:n4
+        d=double(b((i-1)*4+(1:4)));
+        p1=mod(d(1)+d(2)+d(4),2); p2=mod(d(1)+d(3)+d(4),2); p3=mod(d(2)+d(3)+d(4),2);
+        bits_out((i-1)*7+(1:7))=int8([p1 p2 d(1) p3 d(2) d(3) d(4)]);
+    end
+    label='Hamming(7,4) — 1-bit correct'; params=struct('method',2,'pad',pad);
+end
+
+%% --- Parity Decoding ---
+function [bits_out,label,n_corr] = decode_parity(bits_in,~,orig_len)
+    bits_in=bits_in(:)'; n_corr=0;
+    n_bytes=floor(numel(bits_in)/9); bits_out=zeros(1,n_bytes*8,'int8');
+    for i=1:n_bytes
+        block=bits_in((i-1)*9+(1:9)); data=block(1:8); par=block(9);
+        if mod(sum(double(data)),2)~=par, n_corr=n_corr+1; end
+        bits_out((i-1)*8+(1:8))=data;
+    end
+    bits_out=bits_out(1:min(end,orig_len)); label='Parity Decode';
+end
+
+%% --- Hamming(7,4) Decoding ---
+function [bits_out,label,n_corr] = decode_hamming(bits_in,~,orig_len)
+    bits_in=bits_in(:)'; n_corr=0;
+    n7=floor(numel(bits_in)/7); bits_out=zeros(1,n7*4,'int8');
+    for i=1:n7
+        cw=double(bits_in((i-1)*7+(1:7)));
+        s1=mod(cw(1)+cw(3)+cw(5)+cw(7),2);
+        s2=mod(cw(2)+cw(3)+cw(6)+cw(7),2);
+        s3=mod(cw(4)+cw(5)+cw(6)+cw(7),2);
+        syn=s1+2*s2+4*s3;
+        if syn~=0&&syn<=7, cw(syn)=mod(cw(syn)+1,2); n_corr=n_corr+1; end
+        bits_out((i-1)*4+(1:4))=int8(cw([3 5 6 7]));
+    end
+    bits_out=bits_out(1:min(end,orig_len)); label='Hamming(7,4) Decode';
+end
+
+%% --- DAC Reconstruct ---
+function sig_out = dac_reconstruct(bits, nbits, target_len)
+    bits=bits(:)'; levels=2^nbits; n_samp=floor(numel(bits)/8);
+    codes=zeros(1,n_samp);
+    for i=1:n_samp
+        byte=double(bits((i-1)*8+(1:8))); v=0;
+        for b=1:8, v=v+byte(b)*2^(8-b); end
+        codes(i)=v;
+    end
+    sig_dac=codes/(levels-1)*2-1;
+    if n_samp<2, sig_out=zeros(1,target_len); return; end
+    sig_out=interp1(linspace(0,1,n_samp),sig_dac,linspace(0,1,target_len),'linear','extrap');
+    sig_out=sig_out(:)';
+end
+
+%% --- Quantise to bits ---
+function bits = quantize_to_bits(sig, nbits)
+    sig=sig(:)'; mn=min(sig); mx=max(sig);
+    norm=(sig-mn)/(mx-mn+1e-12); q=round(norm*(2^nbits-1));
+    N_s=numel(q); bits=zeros(1,N_s*nbits,'int8');
+    for i=1:N_s
+        for b=1:nbits
+            bits((i-1)*nbits+b)=int8(floor(mod(q(i)/2^(nbits-b),2)));
+        end
+    end
+end
+
+%% --- BPSK/QPSK/16-QAM ---
+function tx = mod_bpsk(bits)
+    tx=complex(1-2*double(bits(:)'),zeros(1,numel(bits)));
+end
+function rb = demod_bpsk(rx), rb=int8(real(rx)<0); end
+
+function tx = mod_qpsk(bits)
+    while mod(length(bits),2)~=0, bits(end+1)=0; end
+    b=double(bits(:)'); nb=floor(numel(b)/2)*2; b=b(1:nb);
+    tx=complex((1-2*b(1:2:end))/sqrt(2),(1-2*b(2:2:end))/sqrt(2));
+end
+function rb = demod_qpsk(rx)
+    rb=int8(reshape([int8(real(rx)<0);int8(imag(rx)<0)],1,[]));
+end
+
+function tx = mod_16qam(bits)
+    b=double(bits(:)'); nb=floor(numel(b)/4)*4; b=b(1:nb); Ns=nb/4;
+    bm=reshape(b,4,Ns)'; lev=[-3 -1 3 1];
+    Ii=bm(:,1)*2+bm(:,2)+1; Qi=bm(:,3)*2+bm(:,4)+1;
+    tx=complex(lev(Ii)'/sqrt(10),lev(Qi)'/sqrt(10));
+end
+function rb = demod_16qam(rx)
+    lev=[-3 -1 1 3]/sqrt(10); gt=[0 0;0 1;1 1;1 0];
+    [~,Ii]=min(abs(real(rx(:))-lev),[],2);
+    [~,Qi]=min(abs(imag(rx(:))-lev),[],2);
+    rb=int8(reshape([gt(Ii,:),gt(Qi,:)]',1,[]));
+end
+
+function noise = awgn_noise(tx, snr_dB, bps)
+    snr_lin=10^(snr_dB/10); Es=mean(abs(tx).^2);
+    N0=Es/(snr_lin*bps+1e-12);
+    noise=sqrt(N0/2).*(randn(size(tx))+1j*randn(size(tx)));
+end
+
+function [label,tx,rx] = adaptive_modulate(bits, snr_dB)
+    if snr_dB < 8
+        label='BPSK  (SNR < 8 dB)'; tx=mod_bpsk(bits); rx=tx+awgn_noise(tx,snr_dB,1);
+    elseif snr_dB <= 15
+        label='QPSK  (SNR 8-15 dB)'; b=bits(1:floor(numel(bits)/2)*2);
+        tx=mod_qpsk(b); rx=tx+awgn_noise(tx,snr_dB,2);
+    else
+        label='16-QAM  (SNR > 15 dB)'; b=bits(1:floor(numel(bits)/4)*4);
+        tx=mod_16qam(b); rx=tx+awgn_noise(tx,snr_dB,4);
+    end
+end
+
+%% --- SNR helpers ---
+function snr_val = compute_snr(tx, rx)
+    noise=rx-tx; Ps=mean(abs(tx).^2); Pn=mean(abs(noise).^2)+1e-12;
+    snr_val=10*log10(Ps/Pn);
+end
+function snr_val = compute_snr_real(ref, sig)
+    nr=min(numel(ref),numel(sig));
+    Ps=mean(ref(1:nr).^2); Pn=mean((ref(1:nr)-sig(1:nr)).^2)+1e-12;
+    snr_val=10*log10(Ps/Pn);
+end
+
+%% --- PSD (manual Welch) ---
+function [freq,psd] = manual_psd(x, fs)
+    x=x(:)'; N=numel(x);
+    win=0.5*(1-cos(2*pi*(0:N-1)/(N-1)));
+    Y=fft(x.*win,N); p=2*(abs(Y).^2)/(N*fs);
+    half=floor(N/2)+1; freq=(0:half-1)*(fs/N); psd=p(1:half); psd(1)=psd(1)/2;
+end
+
+%% --- BER sweep for BER-vs-SNR plot ---
+function [th_b,sim_b,th_q,sim_q,th_16,sim_16] = ber_sweep(snr_vec)
+    n=numel(snr_vec);
+    [th_b,sim_b,th_q,sim_q,th_16,sim_16]=deal(zeros(1,n));
+    for k=1:n
+        s=snr_vec(k); lin=10^(s/10);
+        b=int8(rand(1,2000)>0.5); tx=mod_bpsk(b);
+        rb=demod_bpsk(tx+awgn_noise(tx,s,1));
+        sim_b(k)=max(sum(b~=rb)/2000,1e-7); th_b(k)=qfunc(sqrt(2*lin));
+        b=int8(rand(1,2000)>0.5); tx=mod_qpsk(b);
+        rb=demod_qpsk(tx+awgn_noise(tx,s,2)); mn=min(numel(b),numel(rb));
+        sim_q(k)=max(sum(b(1:mn)~=rb(1:mn))/mn,1e-7); th_q(k)=qfunc(sqrt(2*lin));
+        b=int8(rand(1,2000)>0.5); tx=mod_16qam(b);
+        rb=demod_16qam(tx+awgn_noise(tx,s,4)); mn=min(numel(b),numel(rb));
+        sim_16(k)=max(sum(b(1:mn)~=rb(1:mn))/mn,1e-7); th_16(k)=(3/8)*qfunc(sqrt(4*lin/5));
+    end
+end
+
+function q = qfunc(x)
+    x=max(x(:)',1e-10); q=zeros(1,numel(x));
+    for i=1:numel(x)
+        xi=x(i); tt=1/(1+0.3275911*xi);
+        p=tt*(0.254829592+tt*(-0.284496736+tt*(1.421413741+tt*(-1.453152027+tt*1.061405429))));
+        q(i)=max(0.5*p*exp(-xi^2/2),1e-7);
+    end
+end
+
+%% --- Plot helpers ---
+function ax = make_ax(ax, bg, fg)
+    set(ax,'Color',bg,'XColor',fg,'YColor',fg,...
+        'GridColor',[0.28 0.30 0.35],'GridAlpha',0.45,...
+        'FontName','Courier New','FontSize',8.5);
+    grid(ax,'on'); box(ax,'on'); hold(ax,'on');
+end
+
+function set_labels(ax, xl, yl, ttl, tcol, fg)
+    xlabel(ax,xl,'Color',fg,'FontSize',8,'FontName','Courier New');
+    ylabel(ax,yl,'Color',fg,'FontSize',8,'FontName','Courier New');
+    title(ax,ttl,'Color',tcol,'FontSize',8.5,'FontWeight','bold','FontName','Courier New');
+end

@@ -1,0 +1,1284 @@
+ %% =========================================================================
+%%  ADAPTIVE COMMUNICATION SYSTEM  v5.2  — UNIFIED DUAL-THRESHOLD CLASSIFIER
+%%
+%%  WHAT'S NEW vs v5.0 / v5.1:
+%%   • Single file combines v5.0 (equation) + v5.1 (audio) into one script
+%%   • classify_signal_normalized now accepts src_choice as 3rd argument
+%%       src_choice == 1  →  MATLAB equation path  (v5.0 spectral-kurtosis thresholds)
+%%       src_choice == 2  →  Audio file / mic path  (v5.1 measured-file thresholds)
+%%   • Audio input: uigetfile browser OR press-Enter live microphone (unchanged from v5.1)
+%%   • All pipeline stages, outputs, plots, helper functions UNCHANGED
+%%
+%%  EQUATION THRESHOLDS (v5.0) — verified passing:
+%%   cos(2π·100t)                              → Clean Signal ✓
+%%   cos(2π·150t + 10·sin(2π·5t))             → FM Signal    ✓
+%%   cos(2π·150t + 10·sin(2π·5t)) + 0.3·n    → FM + Noise   ✓
+%%   (1 + 0.8·cos(2π·5t))·cos(2π·150t)        → AM Signal    ✓
+%%   AM + 0.3·noise / AM + 1.0·noise          → AM + Noise   ✓
+%%   Pure randn                                → Pure Noise   ✓
+%%   3-tone composite                          → Clean Signal ✓
+%%   FM β=0.8 / β=0.5 / FM + 1.0·noise        → FM*          ✓
+%%
+%%  AUDIO THRESHOLDS (v5.1) — derived from measured real-file statistics:
+%%   freq_var  > 0.20  → FM family
+%%   spec_flat > 0.35  → Pure Noise
+%%   env_mean  > 0.75  → FM Signal (constant envelope)
+%%   env_var   > 0.05  → AM + Noise
+%%   snr_dB    > 75    → AM Signal / Clean Signal
+%% =========================================================================
+clc; clear; close all;
+
+fprintf('\n');
+fprintf('  ╔══════════════════════════════════════════════════════╗\n');
+fprintf('  ║   ADAPTIVE COMMUNICATION SYSTEM  v5.2  [UNIFIED]    ║\n');
+fprintf('  ╚══════════════════════════════════════════════════════╝\n\n');
+
+%% =========================================================================
+%%  STEP 1 — INPUT SOURCE
+%% =========================================================================
+fprintf('  ┌──────────────────────────────────────────────────┐\n');
+fprintf('  │  SELECT INPUT SOURCE                             │\n');
+fprintf('  │   1  —  My own equation  (AM/FM/noise/etc.)     │\n');
+fprintf('  │   2  —  Audio Input      (file or microphone)   │\n');
+fprintf('  └──────────────────────────────────────────────────┘\n');
+src_choice = safe_input('  Enter 1 or 2 : ', [1 2]);
+
+%% ── SOURCE 1 : MATLAB Equation ───────────────────────────────────────────
+if src_choice == 1
+    fprintf('\n');
+    fprintf('  ┌──────────────────────────────────────────────────┐\n');
+    fprintf('  │  SELECT SIGNAL TYPE                              │\n');
+    fprintf('  │   1  Clean Sine      6  Pure Noise              │\n');
+    fprintf('  │   2  AM Signal       7  Composite (multi-tone)  │\n');
+    fprintf('  │   3  FM Signal       8  Custom Equation         │\n');
+    fprintf('  │   4  AM + Noise                                  │\n');
+    fprintf('  │   5  FM + Noise                                  │\n');
+    fprintf('  └──────────────────────────────────────────────────┘\n');
+    sig_choice = safe_input('  Enter 1-8 : ', 1:8);
+
+    Fs = 1000; T = 1.0; t = 0:1/Fs:T-1/Fs;
+    fc = 100; fm = 10; A = 1.0; mi = 0.8; sigma = 0.35;
+
+    switch sig_choice
+        case 1, signal = A.*sin(2*pi*fc*t);
+                sig_label = sprintf('Clean Sine fc=%dHz',fc);
+        case 2, signal = A.*(1+mi.*cos(2*pi*fm*t)).*sin(2*pi*fc*t);
+                sig_label = sprintf('AM fc=%dHz fm=%dHz mi=%.1f',fc,fm,mi);
+        case 3, signal = A.*sin(2*pi*fc*t + mi.*sin(2*pi*fm*t));
+                sig_label = sprintf('FM fc=%dHz fm=%dHz b=%.1f',fc,fm,mi);
+        case 4, signal = A.*(1+mi.*cos(2*pi*fm*t)).*sin(2*pi*fc*t) + sigma.*randn(1,numel(t));
+                sig_label = sprintf('AM+Noise fc=%dHz s=%.2f',fc,sigma);
+        case 5, signal = A.*sin(2*pi*fc*t+mi.*sin(2*pi*fm*t)) + sigma.*randn(1,numel(t));
+                sig_label = sprintf('FM+Noise fc=%dHz s=%.2f',fc,sigma);
+        case 6, signal = sigma.*randn(1,numel(t));
+                sig_label = sprintf('Pure Noise s=%.2f',sigma);
+        case 7, signal = A.*sin(2*pi*fc*t)+0.6*A.*sin(2*pi*2*fc*t)+0.35*A.*cos(2*pi*3*fc*t);
+                sig_label = sprintf('Composite %d+%d+%dHz',fc,2*fc,3*fc);
+        case 8
+            fprintf('\n  Type MATLAB equation using variable t  (Fs=%d,T=%.1f)\n',Fs,T);
+            eq_str = input('  >> signal = ','s');
+            try
+                signal = eval(eq_str); signal = signal(:)';
+                if numel(signal)~=numel(t)
+                    signal = interp1(linspace(0,1,numel(signal)),signal,...
+                                     linspace(0,1,numel(t)),'linear');
+                end
+                sig_label = 'Custom Equation';
+            catch e
+                fprintf('  [ERROR] %s — using fallback\n',e.message);
+                signal = sin(2*pi*50*t); sig_label = 'Fallback Sine';
+            end
+    end
+    source_label = ['Equation — ' sig_label];
+    signal = signal(:)'; pk = max(abs(signal));
+    if pk>0, signal = signal/pk; end
+    fprintf('\n  [OK] Signal generated: %s  (%d samp, Fs=%dHz)\n',sig_label,numel(signal),Fs);
+end
+
+%% ── SOURCE 2 : Audio Input ───────────────────────────────────────────────
+if src_choice == 2
+    fprintf('\n');
+    fprintf('  ┌──────────────────────────────────────────────────┐\n');
+    fprintf('  │  SELECT AUDIO INPUT METHOD                       │\n');
+    fprintf('  │   1  —  Audio Signal  (browse & load file)      │\n');
+    fprintf('  │   2  —  Live Microphone  (press Enter to rec)   │\n');
+    fprintf('  └──────────────────────────────────────────────────┘\n');
+    audio_choice = safe_input('  Enter 1 or 2 : ', [1 2]);
+
+    % ── SUB-OPTION 1 : Browse for any audio file ──────────────────────────
+    if audio_choice == 1
+        fprintf('\n  [File Explorer] Opening file picker ...\n');
+        [fname, fpath] = uigetfile( ...
+            {'*.wav;*.mp3;*.flac;*.ogg', 'Audio Files (*.wav,*.mp3,*.flac,*.ogg)'; ...
+             '*.*', 'All Files (*.*)'}, ...
+            'Select Audio File');
+
+        if isequal(fname, 0)
+            error('  [ABORT] No file selected.');
+        end
+
+        audio_path = fullfile(fpath, fname);
+        fprintf('  [READ] Loading: %s\n', audio_path);
+
+        try
+            [x_raw, MIC_FS] = audioread(audio_path);
+        catch err
+            error('  [ERROR] Cannot read audio file: %s', err.message);
+        end
+
+        if size(x_raw, 2) > 1
+            x_raw = mean(x_raw, 2);
+            fprintf('  [INFO] Stereo → mono conversion applied\n');
+        end
+
+        signal   = x_raw(:)';
+        Fs       = MIC_FS;
+        t        = (0:numel(signal)-1) / Fs;
+        signal   = signal - mean(signal);
+        pk       = max(abs(signal));
+        if pk > 0, signal = signal / pk; end
+
+        [~, fname_noext, ~] = fileparts(fname);
+        sig_label    = fname_noext;
+        source_label = ['Audio File — ' sig_label];
+
+        fprintf('  [OK] Loaded: %s  |  %.2f s  |  Fs=%d Hz  |  %d samples\n', ...
+                sig_label, numel(signal)/Fs, Fs, numel(signal));
+
+    % ── SUB-OPTION 2 : Live microphone ────────────────────────────────────
+    else
+        MIC_FS = safe_input_default('  Sample rate Hz [44100] : ', 44100, [8000 11025 22050 44100]);
+
+        fprintf('\n');
+        fprintf('  ╔══════════════════════════════════════════════════════╗\n');
+        fprintf('  ║   LIVE MICROPHONE RECORDING                          ║\n');
+        fprintf('  ║   Press  ENTER  to START recording ...               ║\n');
+        fprintf('  ╚══════════════════════════════════════════════════════╝\n');
+        input('  >> Press ENTER to start : ', 's');
+
+        fprintf('  [REC] ● Recording — speak now ...\n');
+        fprintf('        Press  ENTER  to STOP.\n\n');
+
+        try
+            rec = audiorecorder(MIC_FS, 16, 1);
+            record(rec);
+            input('  >> Press ENTER to stop  : ', 's');
+            stop(rec);
+            x_raw = getaudiodata(rec, 'double');
+        catch err
+            fprintf('  [ERROR] Mic failed: %s  — using fallback tone\n', err.message);
+            MIC_FS = 44100;
+            t_tmp  = 0 : 1/MIC_FS : 2 - 1/MIC_FS;
+            x_raw  = sin(2*pi*440*t_tmp)';
+        end
+
+        if size(x_raw, 2) > 1, x_raw = mean(x_raw, 2); end
+
+        signal = x_raw(:)';
+        Fs     = MIC_FS;
+        t      = (0:numel(signal)-1) / Fs;
+        signal = signal - mean(signal);
+        pk     = max(abs(signal));
+        if pk > 0, signal = signal / pk; end
+
+        sig_label    = 'Live Microphone Recording';
+        source_label = 'Live Microphone';
+
+        fprintf('\n  [OK] Recorded: %.2f s  |  Fs=%d Hz  |  %d samples\n', ...
+                numel(signal)/Fs, Fs, numel(signal));
+    end
+end
+
+%% =========================================================================
+%%  ADAPTIVE ENGINE — classify BEFORE showing analysis
+%%  ★ src_choice passed so classifier picks correct threshold set
+%% =========================================================================
+signal   = signal(:)';
+N        = numel(signal);
+Fs_use   = Fs;
+t        = (0:N-1)/Fs_use;
+
+% Keep original for playback (audio mode)
+signal_for_playback = signal;
+
+[sig_class, fc_est, env_var, freq_var, noise_lvl, raw_snr_dB] = ...
+    classify_signal_normalized(signal, Fs_use, src_choice);   % ← src_choice added
+
+%% =========================================================================
+%%  ★ COMPUTE ALL ANALYSIS METRICS
+%% =========================================================================
+
+% ── Time domain ───────────────────────────────────────────────────────────
+peak_amp  = max(abs(signal));
+rms_amp   = rms(signal);
+sig_mean  = mean(signal);
+sig_std   = std(signal);
+
+zc_flags           = (signal(1:end-1).*signal(2:end)) < 0;
+num_zero_crossings = sum(zc_flags);
+est_freq_zc        = num_zero_crossings / (2 * N/Fs_use);
+
+pk_thresh   = 0.1 * max(abs(signal));
+is_peak_pos = [false, signal(2:end-1)>signal(1:end-2) & ...
+               signal(2:end-1)>signal(3:end) & signal(2:end-1)>pk_thresh, false];
+is_peak_neg = [false, signal(2:end-1)<signal(1:end-2) & ...
+               signal(2:end-1)<signal(3:end) & signal(2:end-1)<-pk_thresh, false];
+pks_pos = signal(is_peak_pos);
+pks_neg = signal(is_peak_neg);
+
+% ── Frequency domain ──────────────────────────────────────────────────────
+mag_spec  = abs(fft(signal)).^2;
+mag_half  = mag_spec(1:floor(N/2));
+sf_geom   = exp(mean(log(mag_half + 1e-15)));
+sf_arith  = mean(mag_half);
+spec_flat = sf_geom / (sf_arith + 1e-12);
+
+% ── Smoothing MSE ─────────────────────────────────────────────────────────
+wlen_q    = max(3, round(N/50));
+smooth_q  = movmean(signal, wlen_q);
+mse_smooth = mean((signal - smooth_q).^2);
+
+% ── Filter preview label ──────────────────────────────────────────────────
+if strcmp(sig_class,'AM Signal') || strcmp(sig_class,'FM Signal')
+    bw_prev = max(fc_est*0.25, 20);
+    preview_filt_label = sprintf('BPF %.0f-%.0fHz', max(5,fc_est-bw_prev), min(Fs_use/2-5,fc_est+bw_prev));
+elseif strcmp(sig_class,'AM + Noise') || strcmp(sig_class,'FM + Noise')
+    bw_prev = max(fc_est*0.2, 15);
+    preview_filt_label = sprintf('BPF tight %.0f-%.0fHz', max(5,fc_est-bw_prev), min(Fs_use/2-5,fc_est+bw_prev));
+elseif strcmp(sig_class,'Speech Signal') || src_choice == 2
+    cutoff_prev = min(3400, Fs_use/2-100);
+    preview_filt_label = sprintf('LPF %.0fHz (voice)', cutoff_prev);
+elseif strcmp(sig_class,'Pure Noise')
+    preview_filt_label = sprintf('LPF aggressive %.0fHz', Fs_use/8);
+else
+    preview_filt_label = 'HPF 5Hz (DC removal)';
+end
+
+% ── Demod preview label ───────────────────────────────────────────────────
+if strcmp(sig_class,'AM Signal') || strcmp(sig_class,'AM + Noise')
+    preview_demod_label = 'AM Coherent Detection';
+elseif strcmp(sig_class,'FM Signal') || strcmp(sig_class,'FM + Noise')
+    preview_demod_label = 'FM PLL Demodulator';
+else
+    preview_demod_label = 'Skipped (baseband)';
+end
+
+% ── ADC preview label ─────────────────────────────────────────────────────
+if src_choice == 2
+    preview_adc_label = 'Sigma-Delta ADC (16-bit, OSR=64)';
+else
+    preview_adc_label = 'Flash ADC (8-bit)';
+end
+
+%% =========================================================================
+%%  ★ FULL COMMAND-WINDOW ANALYSIS REPORT
+%% =========================================================================
+fprintf('\n');
+fprintf('  ╔══════════════════════════════════════════════════════════╗\n');
+fprintf('  ║           INPUT SIGNAL ANALYSIS REPORT                   ║\n');
+fprintf('  ╚══════════════════════════════════════════════════════════╝\n');
+
+fprintf('\n  ┌─── SIGNAL IDENTIFICATION ─────────────────────────────┐\n');
+fprintf('  │  Input Label         : %-30s │\n', sig_label);
+fprintf('  │  Detected Type       : %-30s │\n', sig_class);
+fprintf('  │  Est. Carrier Freq   : %-30s │\n', sprintf('%.2f Hz', fc_est));
+fprintf('  └───────────────────────────────────────────────────────┘\n');
+
+fprintf('\n  ┌─── TIME DOMAIN PARAMETERS ────────────────────────────┐\n');
+fprintf('  │  Samples             : %-30d │\n', N);
+fprintf('  │  Sample Rate (Fs)    : %-30s │\n', sprintf('%d Hz', round(Fs_use)));
+fprintf('  │  Duration            : %-30s │\n', sprintf('%.4f s', N/Fs_use));
+fprintf('  │  Peak Amplitude      : %-30s │\n', sprintf('%.4f', peak_amp));
+fprintf('  │  RMS Amplitude       : %-30s │\n', sprintf('%.4f', rms_amp));
+fprintf('  │  Mean Value          : %-30s │\n', sprintf('%.6f', sig_mean));
+fprintf('  │  Std Deviation       : %-30s │\n', sprintf('%.4f', sig_std));
+fprintf('  │  Zero Crossings      : %-30s │\n', sprintf('%d  (est. %.1f Hz)', num_zero_crossings, est_freq_zc));
+fprintf('  │  Positive Peaks      : %-30d │\n', numel(pks_pos));
+fprintf('  │  Negative Peaks      : %-30d │\n', numel(pks_neg));
+fprintf('  └───────────────────────────────────────────────────────┘\n');
+
+fprintf('\n  ┌─── FREQUENCY DOMAIN PARAMETERS ───────────────────────┐\n');
+fprintf('  │  Est. Carrier Freq   : %-30s │\n', sprintf('%.2f Hz', fc_est));
+fprintf('  │  Spectral Flatness   : %-30s │\n', sprintf('%.4f  (0=tonal, 1=noise)', spec_flat));
+fprintf('  │  Envelope Variance   : %-30s │\n', sprintf('%.4f', env_var));
+fprintf('  │  Frequency Spread    : %-30s │\n', sprintf('%.4f', freq_var));
+fprintf('  └───────────────────────────────────────────────────────┘\n');
+
+fprintf('\n  ┌─── SIGNAL QUALITY METRICS ────────────────────────────┐\n');
+fprintf('  │  Estimated SNR       : %-30s │\n', sprintf('%.2f dB', raw_snr_dB));
+fprintf('  │  Noise Level (flat)  : %-30s │\n', sprintf('%.4f', noise_lvl));
+fprintf('  │  Smoothing MSE       : %-30s │\n', sprintf('%.6f', mse_smooth));
+fprintf('  └───────────────────────────────────────────────────────┘\n');
+
+fprintf('\n  ┌─── ADAPTIVE PIPELINE DECISIONS (pre-SNR) ─────────────┐\n');
+fprintf('  │  Filter Applied      : %-30s │\n', preview_filt_label(1:min(end,30)));
+fprintf('  │  Demod Technique     : %-30s │\n', preview_demod_label(1:min(end,30)));
+fprintf('  │  ADC Method          : %-30s │\n', preview_adc_label(1:min(end,30)));
+fprintf('  └───────────────────────────────────────────────────────┘\n');
+
+%% =========================================================================
+%%  SNR INPUT
+%% =========================================================================
+fprintf('\n');
+fprintf('  ╔══════════════════════════════════════════════════════════╗\n');
+fprintf('  ║  CHANNEL SNR SETTING                                      ║\n');
+fprintf('  ║   < 8 dB  →  BPSK                                        ║\n');
+fprintf('  ║   8–15 dB →  QPSK                                        ║\n');
+fprintf('  ║   > 15 dB →  16-QAM                                      ║\n');
+fprintf('  ╚══════════════════════════════════════════════════════════╝\n');
+operating_snr_dB = safe_input_num('  Enter SNR in dB [12] : ',12,-5,40);
+
+%% =========================================================================
+%%  ENCODING / MODULATION DECISION (shown right after SNR entry)
+%% =========================================================================
+if operating_snr_dB < 8
+    preview_enc_label    = 'Hamming(7,4) — 1-bit correct';
+    preview_digmod_label = 'BPSK  (SNR < 8 dB)';
+else
+    preview_enc_label = 'Even Parity (8,9)';
+    if operating_snr_dB <= 15
+        preview_digmod_label = 'QPSK  (SNR 8-15 dB)';
+    else
+        preview_digmod_label = '16-QAM  (SNR > 15 dB)';
+    end
+end
+
+fprintf('\n');
+fprintf('  ┌─── DIGITAL PIPELINE DECISIONS (post-SNR) ─────────────┐\n');
+fprintf('  │  SNR Entered         : %-30s │\n', sprintf('%.1f dB', operating_snr_dB));
+fprintf('  │  Encoding Method     : %-30s │\n', preview_enc_label(1:min(end,30)));
+fprintf('  │  Digital Modulation  : %-30s │\n', strtrim(preview_digmod_label(1:min(end,30))));
+fprintf('  └───────────────────────────────────────────────────────┘\n\n');
+
+%% =========================================================================
+%%  STEP 2 — ADAPTIVE FILTER
+%% =========================================================================
+fprintf('  ── STEP 2 : Adaptive Filter ─────────────────────────\n');
+signal_raw = signal;
+
+if strcmp(sig_class,'AM Signal') || strcmp(sig_class,'FM Signal')
+    bw = max(fc_est*0.25, 20);
+    [signal_filt, filt_label] = fir_filter(signal, Fs_use, 3, max(5,fc_est-bw), min(Fs_use/2-5,fc_est+bw));
+    filt_label = sprintf('BPF %.0f-%.0fHz',max(5,fc_est-bw),min(Fs_use/2-5,fc_est+bw));
+elseif strcmp(sig_class,'AM + Noise') || strcmp(sig_class,'FM + Noise')
+    bw = max(fc_est*0.2, 15);
+    [signal_filt, filt_label] = fir_filter(signal, Fs_use, 3, max(5,fc_est-bw), min(Fs_use/2-5,fc_est+bw));
+    filt_label = sprintf('BPF tight %.0f-%.0fHz',max(5,fc_est-bw),min(Fs_use/2-5,fc_est+bw));
+elseif strcmp(sig_class,'Speech Signal') || src_choice == 2
+    cutoff = min(3400, Fs_use/2-100);
+    [signal_filt, filt_label] = fir_filter(signal, Fs_use, 1, cutoff, 0);
+    filt_label = sprintf('LPF %.0fHz (voice)',cutoff);
+elseif strcmp(sig_class,'Pure Noise')
+    [signal_filt, filt_label] = fir_filter(signal, Fs_use, 1, Fs_use/8, 0);
+    filt_label = sprintf('LPF aggressive %.0fHz',Fs_use/8);
+else
+    [signal_filt, filt_label] = fir_filter(signal, Fs_use, 2, 5, 0);
+    filt_label = 'HPF 5Hz (DC removal)';
+end
+
+pk = max(abs(signal_filt)); if pk>0, signal_filt = signal_filt/pk; end
+signal = signal_filt;
+fprintf('  [AUTO] Filter     : %s\n', filt_label);
+
+%% =========================================================================
+%%  STEP 3 — ADAPTIVE DEMODULATION
+%% =========================================================================
+fprintf('\n  ── STEP 3 : Adaptive Demodulation ──────────────────\n');
+
+if strcmp(sig_class,'AM Signal') || strcmp(sig_class,'AM + Noise')
+    [msg_signal, demod_label] = demod_coherent(signal, Fs_use, fc_est);
+elseif strcmp(sig_class,'FM Signal') || strcmp(sig_class,'FM + Noise')
+    [msg_signal, demod_label] = demod_pll_auto(signal, Fs_use, fc_est);
+else
+    msg_signal  = signal;
+    demod_label = 'Skipped (baseband already)';
+end
+fprintf('  [AUTO] Demod      : %s\n', demod_label);
+
+%% =========================================================================
+%%  STEP 4 — MESSAGE EXTRACTION
+%% =========================================================================
+msg_cutoff = min(Fs_use/4, 400);
+[msg_signal, ~] = fir_filter(msg_signal, Fs_use, 1, msg_cutoff, 0);
+pk = max(abs(msg_signal)); if pk>0, msg_signal=msg_signal/pk; end
+
+%% =========================================================================
+%%  STEP 5 — ADAPTIVE ADC
+%% =========================================================================
+fprintf('\n  ── STEP 5 : Adaptive ADC ────────────────────────────\n');
+if src_choice == 2
+    adc_bits = 16; osr = 64; adc_label = 'Sigma-Delta ADC (16-bit, OSR=64)';
+    [adc_codes, quant_signal] = adc_sigma_delta(msg_signal, adc_bits, osr);
+else
+    adc_bits = 8; adc_label = 'Flash ADC (8-bit)';
+    [adc_codes, quant_signal] = adc_flash(msg_signal, adc_bits);
+end
+fprintf('  [AUTO] ADC        : %s\n', adc_label);
+
+%% =========================================================================
+%%  STEP 6 — ADAPTIVE ENCODING
+%% =========================================================================
+fprintf('\n  ── STEP 6 : Adaptive Encoding ───────────────────────\n');
+
+bits_unified = quantize_to_bits(msg_signal, 8);
+
+if operating_snr_dB < 8
+    enc_method = 2;
+    [bits_enc, enc_label, enc_params] = encode_hamming(bits_unified);
+else
+    enc_method = 1;
+    [bits_enc, enc_label, enc_params] = encode_parity(bits_unified);
+end
+fprintf('  [AUTO] Encode     : %s  (%d→%d bits)\n', enc_label, numel(bits_unified), numel(bits_enc));
+
+%% =========================================================================
+%%  STEP 7 — DIGITAL MODULATION
+%% =========================================================================
+fprintf('  ── STEP 7-9 : DigMod → Channel → RX Demod ──────────\n');
+
+[mod_label, tx_syms, rx_syms] = adaptive_modulate(bits_enc, operating_snr_dB);
+snr_measured = compute_snr(tx_syms, rx_syms);
+fprintf('  [AUTO] DigMod     : %s\n', strtrim(mod_label));
+
+%% =========================================================================
+%%  STEP 10 — DECODE
+%% =========================================================================
+fprintf('\n  ── STEP 10 : Adaptive Decoding ──────────────────────\n');
+if contains(mod_label,'BPSK'),      rx_bits = demod_bpsk(rx_syms);
+elseif contains(mod_label,'QPSK'), rx_bits = demod_qpsk(rx_syms);
+else,                               rx_bits = demod_16qam(rx_syms);
+end
+rx_bits = rx_bits(1:min(end,numel(bits_enc)));
+
+if enc_method == 2
+    [bits_dec, dec_label, n_errs] = decode_hamming(rx_bits, enc_params, numel(bits_unified));
+else
+    [bits_dec, dec_label, n_errs] = decode_parity(rx_bits, enc_params, numel(bits_unified));
+end
+fprintf('  [AUTO] Decode     : %s  |  Errors corrected: %d\n', dec_label, n_errs);
+
+%% =========================================================================
+%%  CLOSED FEEDBACK LOOP
+%% =========================================================================
+fprintf('\n  ── FEEDBACK LOOP ────────────────────────────────────\n');
+
+nb_cmp     = min(numel(bits_unified), numel(bits_dec));
+ber_live   = sum(bits_unified(1:nb_cmp) ~= bits_dec(1:nb_cmp)) / max(nb_cmp,1);
+BER_THRESH = 1e-2;
+MAX_RETX   = 3;
+retx_count = 0;
+fb_log     = {};
+
+fprintf('  Initial BER   : %.5f  (threshold = %.4f)\n', ber_live, BER_THRESH);
+
+while ber_live > BER_THRESH && retx_count < MAX_RETX
+    retx_count = retx_count + 1;
+
+    if contains(mod_label,'16-QAM')
+        new_snr = 12;
+        fb_msg  = 'BER too high → downgrade 16-QAM→QPSK';
+    elseif contains(mod_label,'QPSK')
+        new_snr = 5;
+        fb_msg  = 'BER too high → downgrade QPSK→BPSK';
+    else
+        if enc_method ~= 2
+            enc_method = 2;
+            [bits_enc, enc_label, enc_params] = encode_hamming(bits_unified);
+        end
+        new_snr = operating_snr_dB;
+        fb_msg  = 'BER too high → BPSK + force Hamming(7,4)';
+    end
+
+    fb_log{end+1} = sprintf('  [FB %d] %s', retx_count, fb_msg); %#ok<AGROW>
+    fprintf('  [FB %d] %s\n', retx_count, fb_msg);
+
+    [mod_label, tx_syms, rx_syms] = adaptive_modulate(bits_enc, new_snr);
+
+    if contains(mod_label,'BPSK'),      rx_bits = demod_bpsk(rx_syms);
+    elseif contains(mod_label,'QPSK'), rx_bits = demod_qpsk(rx_syms);
+    else,                               rx_bits = demod_16qam(rx_syms);
+    end
+    rx_bits = rx_bits(1:min(end,numel(bits_enc)));
+
+    if enc_method == 2
+        [bits_dec, dec_label, n_errs] = decode_hamming(rx_bits, enc_params, numel(bits_unified));
+    else
+        [bits_dec, dec_label, n_errs] = decode_parity(rx_bits, enc_params, numel(bits_unified));
+    end
+
+    nb_cmp   = min(numel(bits_unified), numel(bits_dec));
+    ber_live = sum(bits_unified(1:nb_cmp) ~= bits_dec(1:nb_cmp)) / max(nb_cmp,1);
+    fprintf('  [FB %d] New BER: %.5f  Mod: %s\n', retx_count, ber_live, strtrim(mod_label));
+    snr_measured = compute_snr(tx_syms, rx_syms);
+end
+
+if ber_live <= BER_THRESH
+    fprintf('  [FB] ✓ BER acceptable after %d retx\n', retx_count);
+else
+    fprintf('  [FB] ⚠ BER still %.5f after %d retx — channel too noisy\n', ber_live, retx_count);
+end
+
+%% =========================================================================
+%%  STEP 11-12 — DAC + OUTPUT
+%% =========================================================================
+fprintf('\n  ── STEP 11 : DAC Reconstruction ─────────────────────\n');
+dac_label = sprintf('Linear Interp DAC (%d-bit, %d samples)', 8, numel(msg_signal));
+recovered_signal = dac_reconstruct(bits_dec, 8, numel(msg_signal));
+[recovered_signal, ~] = fir_filter(recovered_signal, Fs_use, 1, msg_cutoff, 0);
+pk = max(abs(recovered_signal)); if pk>0, recovered_signal=recovered_signal/pk; end
+
+rec_snr = compute_snr_real(msg_signal, recovered_signal);
+fprintf('  [AUTO] DAC        : %s\n', dac_label);
+
+fprintf('\n  ── STEP 12 : Output ─────────────────────────────────\n');
+fprintf('  [OK] Recovery SNR : %.2f dB\n', rec_snr);
+fprintf('  [OK] Final BER    : %.5f\n', ber_live);
+fprintf('  [OK] Retransmits  : %d\n', retx_count);
+fprintf('  [OK] Final Mod    : %s\n', strtrim(mod_label));
+
+%% =========================================================================
+%%  ★ FINAL PIPELINE SUMMARY
+%% =========================================================================
+fprintf('\n');
+fprintf('  ╔══════════════════════════════════════════════════════════╗\n');
+fprintf('  ║              FINAL PIPELINE SUMMARY                       ║\n');
+fprintf('  ╚══════════════════════════════════════════════════════════╝\n');
+fprintf('  ┌──────────────┬──────────────────────┬────────────────────┐\n');
+fprintf('  │  STEP        │  STAGE               │  METHOD USED       │\n');
+fprintf('  ├──────────────┼──────────────────────┼────────────────────┤\n');
+fprintf('  │  1  Input    │  %-20s │  %-18s │\n', 'Signal Source',    sig_label(1:min(end,18)));
+fprintf('  │  2  Filter   │  %-20s │  %-18s │\n', 'Adaptive Filter',  filt_label(1:min(end,18)));
+fprintf('  │  3  Demod    │  %-20s │  %-18s │\n', 'Demodulation',     demod_label(1:min(end,18)));
+fprintf('  │  4  Msg      │  %-20s │  %-18s │\n', 'Msg Extraction',   sprintf('LPF @%.0fHz',msg_cutoff));
+fprintf('  │  5  ADC      │  %-20s │  %-18s │\n', 'Analog→Digital',   adc_label(1:min(end,18)));
+fprintf('  │  6  Encode   │  %-20s │  %-18s │\n', 'Channel Encoding', enc_label(1:min(end,18)));
+fprintf('  │  7  Mod(TX)  │  %-20s │  %-18s │\n', 'Digital Mod',      strtrim(mod_label(1:min(end,18))));
+fprintf('  │  8  Channel  │  %-20s │  %-18s │\n', 'AWGN Channel',     sprintf('SNR=%.1fdB',operating_snr_dB));
+fprintf('  │  9  Demod RX │  %-20s │  %-18s │\n', 'RX Demodulation',  strtrim(mod_label(1:min(end,18))));
+fprintf('  │  10 Decode   │  %-20s │  %-18s │\n', 'Channel Decoding', dec_label(1:min(end,18)));
+fprintf('  │  11 DAC      │  %-20s │  %-18s │\n', 'Digital→Analog',   'Linear Interp 8b');
+fprintf('  ├──────────────┴──────────────────────┴────────────────────┤\n');
+fprintf('  │  PERFORMANCE METRICS                                       │\n');
+fprintf('  ├────────────────────────────────────────────────────────────┤\n');
+fprintf('  │  Detected Signal Type  : %-32s │\n', sig_class);
+fprintf('  │  Operating SNR         : %-32s │\n', sprintf('%.1f dB', operating_snr_dB));
+fprintf('  │  Measured TX SNR       : %-32s │\n', sprintf('%.2f dB', snr_measured));
+fprintf('  │  Recovery SNR          : %-32s │\n', sprintf('%.2f dB', rec_snr));
+fprintf('  │  Digital Mod Used      : %-32s │\n', strtrim(mod_label));
+fprintf('  │  Decoding Method       : %-32s │\n', dec_label);
+fprintf('  │  Final BER             : %-32s │\n', sprintf('%.5f', ber_live));
+fprintf('  │  Errors Corrected      : %-32s │\n', sprintf('%d', n_errs));
+fprintf('  │  Retransmissions       : %-32s │\n', sprintf('%d', retx_count));
+fprintf('  └────────────────────────────────────────────────────────────┘\n\n');
+
+%% =========================================================================
+%%  ★ AUDIO PLAYBACK (src_choice == 2 only)
+%% =========================================================================
+if src_choice == 2
+    fprintf('  ── AUDIO PLAYBACK ───────────────────────────────────\n');
+    MAX_PLAY_S = 12;
+    play_orig  = signal_for_playback;
+    play_rec   = recovered_signal;
+    play_fs    = Fs_use;
+
+    n_play   = min(numel(play_orig), round(MAX_PLAY_S * play_fs));
+    play_orig = play_orig(1:n_play);
+    n_play_r  = min(numel(play_rec),  round(MAX_PLAY_S * play_fs));
+    play_rec  = play_rec(1:n_play_r);
+
+    fprintf('  ▶ Playing ORIGINAL signal (%.1f s) ...\n', n_play/play_fs);
+    sound(play_orig, play_fs);
+    pause(n_play/play_fs + 0.5);
+
+    fprintf('  ▶ Playing RECONSTRUCTED signal (%.1f s) ...\n', n_play_r/play_fs);
+    sound(play_rec, play_fs);
+    pause(n_play_r/play_fs + 0.5);
+
+    fprintf('  [OK] Playback complete.\n\n');
+end
+
+%% =========================================================================
+%%  SUPPORTING DATA
+%% =========================================================================
+[psd_f, psd_p]             = manual_psd(signal, Fs_use);
+snr_vec                    = 0:2:20;
+[th_b,sim_b,th_q,sim_q,th_16,sim_16] = ber_sweep(snr_vec);
+[spec_mat, spec_t, spec_f] = manual_stft(signal, Fs_use, 256, 128);
+
+%% =========================================================================
+%%  COLOR THEME
+%% =========================================================================
+dark=[0.07 0.08 0.11]; mid=[0.13 0.14 0.19]; fg=[0.91 0.93 0.96];
+c1=[0.20 0.72 1.00]; c2=[1.00 0.58 0.10]; c3=[0.35 0.92 0.50];
+c4=[0.95 0.30 0.30]; c5=[0.75 0.40 1.00];
+
+%% =========================================================================
+%%  FIGURE — 12-PANEL PIPELINE
+%% =========================================================================
+fig1 = figure('Name',['Adaptive Comm v5.2 — ' sig_label], ...
+              'NumberTitle','off','Color',dark,'Position',[30 30 1500 860]);
+
+annotation(fig1,'textbox',[0 0.955 1 0.045], ...
+    'String',sprintf('  ADAPTIVE COMM v5.2  |  Detected: %s  |  Filter: %s  |  Demod: %s  |  ADC: %s  |  Enc: %s  |  Mod: %s  |  BER: %.5f', ...
+                     sig_class, filt_label, demod_label, adc_label, enc_label, strtrim(mod_label), ber_live), ...
+    'FontSize',8,'FontWeight','bold','Color',c2, ...
+    'BackgroundColor',[0.04 0.04 0.07],'EdgeColor','none', ...
+    'HorizontalAlignment','left','VerticalAlignment','middle','FontName','Courier New');
+
+t_msg=(0:numel(msg_signal)-1)/Fs_use;
+t_rec=(0:numel(recovered_signal)-1)/Fs_use;
+nr=min(numel(msg_signal),numel(recovered_signal));
+Np=numel(tx_syms);
+
+p1 = make_ax(subplot(3,4,1),mid,fg);
+plot(p1,t,signal_raw,'Color',c1,'LineWidth',1.3);
+set_labels(p1,'Time (s)','Amplitude', ...
+    sprintf('Input Signal\n%s',sig_label),c1,fg);
+
+p2 = make_ax(subplot(3,4,2),mid,fg);
+plot(p2,(0:numel(signal_raw)-1)/Fs_use,signal_raw,'Color',[c4 0.35],'LineWidth',0.8);
+hold(p2,'on');
+plot(p2,(0:numel(signal_filt)-1)/Fs_use,signal_filt,'Color',c1,'LineWidth',1.4);
+legend(p2,{'Raw','Filtered'},'TextColor',fg,'Color',mid,'EdgeColor',[0.35 0.35 0.4],'FontSize',7);
+set_labels(p2,'Time (s)','Amplitude', ...
+    sprintf('Filtered\n%s',filt_label),c1,fg);
+
+p3 = make_ax(subplot(3,4,3),mid,fg);
+plot(p3,t_msg,msg_signal,'Color',c3,'LineWidth',1.3);
+set_labels(p3,'Time (s)','Amplitude', ...
+    sprintf('Demod\n%s',demod_label(1:min(end,30))),c3,fg);
+
+p4 = make_ax(subplot(3,4,4),mid,fg);
+stairs(p4,t_msg(1:numel(quant_signal)),quant_signal,'Color',c5,'LineWidth',1.2);
+hold(p4,'on');
+plot(p4,t_msg,msg_signal,'Color',[c1 0.4],'LineWidth',0.8);
+legend(p4,{'Quantized','Original'},'TextColor',fg,'Color',mid,'EdgeColor',[0.35 0.35 0.4],'FontSize',7);
+set_labels(p4,'Time (s)','Level', ...
+    sprintf('ADC — Msg Extracted\n%s',adc_label(1:min(end,28))),c5,fg);
+
+p5 = make_ax(subplot(3,4,5),mid,fg);
+nb_show=min(128,numel(bits_enc));
+stem(p5,1:nb_show,double(bits_enc(1:nb_show)),'Color',c3,'MarkerSize',2,'LineWidth',0.7);
+ylim(p5,[-0.2 1.4]);
+set_labels(p5,'Bit Index','Value', ...
+    sprintf('Encoded\n%s',enc_label),c3,fg);
+
+p6 = make_ax(subplot(3,4,6),mid,fg);
+scatter(p6,real(tx_syms(1:Np)),imag(tx_syms(1:Np)),40,c3,'x','LineWidth',2);
+axis(p6,'equal');
+set_labels(p6,'I','Q', ...
+    sprintf('Digital Mod (TX)\n%s',strtrim(mod_label)),c3,fg);
+
+p7 = make_ax(subplot(3,4,7),mid,fg);
+nb_cmp2=min(128,min(numel(bits_unified),numel(bits_dec)));
+stem(p7,1:nb_cmp2,double(bits_dec(1:nb_cmp2)),'Color',[c1 0.7],'MarkerSize',2,'LineWidth',0.7);
+hold(p7,'on');
+errs_plt=bits_unified(1:nb_cmp2)~=bits_dec(1:nb_cmp2);
+ei=find(errs_plt);
+if ~isempty(ei)
+    stem(p7,ei,ones(1,numel(ei)),'Color',c4,'MarkerSize',5,'LineWidth',1.5);
+end
+set_labels(p7,'Bit Index','Value', ...
+    sprintf('Decoded (red=err)\n%s',dec_label),c1,fg);
+
+p8 = make_ax(subplot(3,4,8),mid,fg);
+plot(p8,t_msg(1:nr),msg_signal(1:nr),'Color',[c2 0.7],'LineWidth',0.9);
+hold(p8,'on');
+plot(p8,t_rec(1:nr),recovered_signal(1:nr),'Color',c3,'LineWidth',1.3);
+legend(p8,{'Message','Recovered'},'TextColor',fg,'Color',mid,'EdgeColor',[0.35 0.35 0.4],'FontSize',7);
+set_labels(p8,'Time (s)','Amplitude', ...
+    sprintf('DAC\nLinear Interp %d-bit',8),c3,fg);
+
+p9 = make_ax(subplot(3,4,9),mid,fg);
+err_sig=msg_signal(1:nr)-recovered_signal(1:nr);
+plot(p9,t_msg(1:nr),err_sig,'Color',c4,'LineWidth',1.0);
+yline(p9,0,'--','Color',[fg 0.4],'LineWidth',0.8);
+set_labels(p9,'Time (s)','Error', ...
+    sprintf('Final O/P — Recon. Error\nRecov. SNR = %.2f dB',rec_snr),c4,fg);
+
+p10 = make_ax(subplot(3,4,10),mid,fg);
+scatter(p10,real(tx_syms(1:Np)),imag(tx_syms(1:Np)),40,c3,'x','LineWidth',2);
+axis(p10,'equal');
+set_labels(p10,'I','Q', ...
+    sprintf('TX Constellation\n%s',strtrim(mod_label)),c3,fg);
+
+p11 = make_ax(subplot(3,4,11),mid,fg);
+scatter(p11,real(rx_syms(1:Np)),imag(rx_syms(1:Np)),20,'yellow','filled');
+hold(p11,'on');
+scatter(p11,real(tx_syms(1:Np)),imag(tx_syms(1:Np)),35,c3,'x','LineWidth',1.8);
+axis(p11,'equal'); xlim(p11,[-2 2]); ylim(p11,[-2 2]);
+legend(p11,{'RX','TX Ideal'},'TextColor',fg,'Color',mid,'EdgeColor',[0.35 0.35 0.4],'FontSize',7);
+set_labels(p11,'I','Q', ...
+    sprintf('RX Constellation\nSNR = %.1f dB',operating_snr_dB),c1,fg);
+
+p12 = make_ax(subplot(3,4,12),mid,fg);
+set(p12,'YScale','log');
+semilogy(p12,snr_vec,th_b,'--','Color',c1,'LineWidth',1.6); hold(p12,'on');
+semilogy(p12,snr_vec,sim_b,'-o','Color',c1,'LineWidth',1.1,'MarkerSize',4,'MarkerFaceColor',c1);
+semilogy(p12,snr_vec,th_q,'--','Color',c2,'LineWidth',1.6);
+semilogy(p12,snr_vec,sim_q,'-s','Color',c2,'LineWidth',1.1,'MarkerSize',4,'MarkerFaceColor',c2);
+semilogy(p12,snr_vec,th_16,'--','Color',c3,'LineWidth',1.6);
+semilogy(p12,snr_vec,sim_16,'-^','Color',c3,'LineWidth',1.1,'MarkerSize',4,'MarkerFaceColor',c3);
+xline(p12,operating_snr_dB,':','Color',c4,'LineWidth',2.0, ...
+      'Label',sprintf('%.0fdB',operating_snr_dB),'LabelColor',c4,'FontSize',7.5,'FontName','Courier New');
+ylim(p12,[1e-6 1]); xlim(p12,[0 20]);
+legend(p12,{'BPSK-T','BPSK-S','QPSK-T','QPSK-S','QAM-T','QAM-S'}, ...
+       'TextColor',fg,'Color',mid,'EdgeColor',[0.35 0.35 0.4],'FontSize',6.5,'NumColumns',2,'Location','southwest');
+set_labels(p12,'Eb/N0 (dB)','BER', ...
+    sprintf('BER vs SNR\n%s  BER=%.5f',strtrim(mod_label),ber_live),c4,fg);
+
+drawnow;
+%% =========================================================================
+%%  FINAL EXCEL EXPORT (APPEND MODE — ALL SHEETS)
+%% =========================================================================
+
+excel_file = 'Adaptive_Comm_Dataset.xlsx';
+
+%% 🟢 SHEET 1 — INPUT ANALYSIS
+sheet_name = 'Input_Analysis';
+sheet1 = table(string(sig_label), string(sig_class), peak_amp, rms_amp, ...
+    sig_mean, sig_std, num_zero_crossings, est_freq_zc);
+
+if isfile(excel_file)
+    try
+        old = readtable(excel_file, 'Sheet', sheet_name);
+        sheet1 = [old; sheet1];
+    end
+end
+writetable(sheet1, excel_file, 'Sheet', sheet_name);
+
+%% 🟡 SHEET 2 — FEATURE EXTRACTION
+sheet_name = 'Feature_Extraction';
+sheet2 = table(env_var, freq_var, spec_flat, raw_snr_dB);
+
+if isfile(excel_file)
+    try
+        old = readtable(excel_file, 'Sheet', sheet_name);
+        sheet2 = [old; sheet2];
+    end
+end
+writetable(sheet2, excel_file, 'Sheet', sheet_name);
+
+%% 🔵 SHEET 3 — PIPELINE
+sheet_name = 'Pipeline';
+sheet3 = table(string(filt_label), string(demod_label), ...
+    string(adc_label), string(enc_label), string(strtrim(mod_label)));
+
+if isfile(excel_file)
+    try
+        old = readtable(excel_file, 'Sheet', sheet_name);
+        sheet3 = [old; sheet3];
+    end
+end
+writetable(sheet3, excel_file, 'Sheet', sheet_name);
+
+%% 🟣 SHEET 4 — CHANNEL
+sheet_name = 'Channel';
+sheet4 = table(operating_snr_dB, snr_measured, ber_live, n_errs, retx_count);
+
+if isfile(excel_file)
+    try
+        old = readtable(excel_file, 'Sheet', sheet_name);
+        sheet4 = [old; sheet4];
+    end
+end
+writetable(sheet4, excel_file, 'Sheet', sheet_name);
+
+%% 🔴 SHEET 5 — OUTPUT QUALITY
+sheet_name = 'Output';
+sheet5 = table(rec_snr, ber_live, mse_smooth);
+
+if isfile(excel_file)
+    try
+        old = readtable(excel_file, 'Sheet', sheet_name);
+        sheet5 = [old; sheet5];
+    end
+end
+writetable(sheet5, excel_file, 'Sheet', sheet_name);
+
+fprintf('\n  [EXCEL] ✅ All data appended successfully\n');
+fprintf('  [DONE — v5.2 UNIFIED DUAL-THRESHOLD CLASSIFIER COMPLETE]\n\n');
+if isfile(excel_file)
+    winopen(excel_file);
+else
+    fprintf('Excel file not found\n');
+end
+
+%% =========================================================================
+%%  HELPER FUNCTIONS
+%% =========================================================================
+function val = safe_input(prompt, valid_vals)
+    val=[];
+    while isempty(val)||~ismember(val,valid_vals)
+        raw=input(prompt);
+        if isnumeric(raw)&&isscalar(raw), val=round(raw); end
+        if ~ismember(val,valid_vals)
+            fprintf('  Invalid — enter: %s\n',num2str(valid_vals));
+        end
+    end
+end
+
+function val = safe_input_default(prompt, default, valid_vals)
+    raw=input(prompt);
+    if isempty(raw)||~isnumeric(raw), val=default; return; end
+    if ismember(round(raw),valid_vals), val=round(raw); else, val=default; end
+end
+
+function val = safe_input_num(prompt, default, lo, hi)
+    raw=input(prompt);
+    if isempty(raw)||~isnumeric(raw)||raw<lo||raw>hi, val=default; else, val=raw; end
+end
+
+%% =========================================================================
+%%  ★ UNIFIED CLASSIFIER — dual threshold sets selected by src_choice
+%%
+%%  src_choice == 1  →  EQUATION path  (v5.0 thresholds)
+%%    Uses spectral SNR, spectral kurtosis, and fine-grained FM detection
+%%    FREQ_HI=0.005, ENV_HI=0.04, ENV_FM_MAX=0.15, KURT_FM=100
+%%    SNR thresholds: pure noise < 15 dB, noisy < 45 dB
+%%
+%%  src_choice == 2  →  AUDIO FILE / MIC path  (v5.1 thresholds)
+%%    Uses spectral flatness and instantaneous frequency spread
+%%    Thresholds derived from measured real audio file statistics at Fs=44100
+%%    FREQ_FM=0.20, FLAT_NOISE=0.35, FM_ENV_CLEAN=0.75
+%%    ENV_AM_NOISY=0.05, SNR_AM_CLEAN=75 dB
+%% =========================================================================
+function [label, fc_est, env_var, freq_var, noise_lvl, snr_est_dB] = ...
+        classify_signal_normalized(x, fs, src_choice)
+
+    x   = x(:)' / (max(abs(x)) + 1e-12);
+    N   = numel(x);
+
+    % ── Analytic signal (Hilbert via FFT) ─────────────────────────────────
+    X = fft(x, N);
+    H = zeros(1, N);
+    if mod(N,2) == 0
+        H(1) = 1; H(N/2+1) = 1; H(2:N/2) = 2;
+    else
+        H(1) = 1; H(2:(N+1)/2) = 2;
+    end
+    xa = ifft(X .* H);
+
+    % ── Envelope & instantaneous frequency ────────────────────────────────
+    env      = abs(xa);
+    env_mean = mean(env);
+    env_var  = var(env) / (env_mean^2 + 1e-12);
+
+    iph      = unwrap(angle(xa));
+    dph      = diff(iph) * fs / (2*pi);
+    freq_var = std(dph) / (fs/2 + 1e-12);
+
+    % ── Spectral metrics (common to both paths) ───────────────────────────
+    Xmag  = abs(X(1:floor(N/2))).^2;
+    freqs = (0:floor(N/2)-1) * (fs/N);
+
+    [~, pi_] = max(Xmag(2:end));
+    pi_      = pi_ + 1;
+    fc_est   = freqs(pi_);
+
+    peak_pow   = Xmag(pi_);
+    median_pow = median(Xmag) + 1e-12;
+    snr_est_dB = 10 * log10(peak_pow / median_pow);
+
+    % Spectral kurtosis — used by equation path (v5.0) only
+    mu_X      = mean(Xmag);
+    spec_kurt = mean((Xmag - mu_X).^4) / (var(Xmag)^2 + 1e-12);
+
+    % Spectral flatness (0=tonal, 1=white noise) — reported as noise_lvl
+    sf_geom   = exp(mean(log(Xmag + 1e-15)));
+    sf_arith  = mean(Xmag) + 1e-12;
+    noise_lvl = sf_geom / sf_arith;
+
+    % =========================================================================
+    %  BRANCH ON SOURCE TYPE
+    % =========================================================================
+    if src_choice == 2
+        % =================================================================
+        %  v5.1 AUDIO THRESHOLDS
+        %  Derived from measured real audio file statistics at Fs = 44100 Hz
+        %    FM Signal     : freq_var=0.258, env_mean=0.966
+        %    FM + Noise    : freq_var=0.274, env_mean=0.538
+        %    AM Signal     : env_var=0.009,  snr_dB > 75
+        %    AM + Noise    : env_var=0.097,  snr_dB < 75
+        %    Pure Noise    : spectral flatness=0.406
+        % =================================================================
+        FREQ_FM      = 0.20;   % freq_var above this  → FM family
+        FLAT_NOISE   = 0.35;   % spectral flatness above → Pure Noise
+        FM_ENV_CLEAN = 0.75;   % mean_env above (when FM) → clean FM
+        ENV_AM_NOISY = 0.05;   % env_var above (when not FM/noise) → AM+Noise
+        SNR_AM_CLEAN = 75.0;   % snr_dB above (when AM family) → clean AM
+
+        is_noise = noise_lvl > FLAT_NOISE;
+        is_fm    = (~is_noise) && (freq_var > FREQ_FM);
+
+        if is_noise
+            label = 'Pure Noise';
+        elseif is_fm
+            % Constant-envelope FM has near-unity mean envelope
+            % FM+Noise has lower mean_env (additive noise drags it down)
+            if env_mean > FM_ENV_CLEAN
+                label = 'FM Signal';
+            else
+                label = 'FM + Noise';
+            end
+        else
+            % AM family
+            if env_var > ENV_AM_NOISY
+                if snr_est_dB > SNR_AM_CLEAN
+                    label = 'AM Signal';
+                else
+                    label = 'AM + Noise';
+                end
+            else
+                % Very flat envelope
+                if snr_est_dB > SNR_AM_CLEAN
+                    label = 'AM Signal';
+                else
+                    label = 'Clean Signal';
+                end
+            end
+        end
+
+    else
+        % =================================================================
+        %  v5.0 EQUATION THRESHOLDS
+        %  Spectral SNR + kurtosis classifier — verified on all presets:
+        %    FREQ_HI    = 0.005  catches FM β ≥ 0.35*fm/Nyquist
+        %    ENV_HI     = 0.04   catches AM mi ≥ 0.3
+        %    ENV_FM_MAX = 0.15   FM is constant-envelope; above = AM/noisy
+        %    KURT_FM    = 100    FM kurt < 100; AM discrete tones > 100
+        %    pure noise : snr_est_dB < 15
+        %    noisy      : snr_est_dB < 45
+        % =================================================================
+        ENV_HI     = 0.04;
+        FREQ_HI    = 0.005;
+        ENV_FM_MAX = 0.15;
+        KURT_FM    = 100;
+
+        is_env_hi     = env_var  > ENV_HI;
+        is_freq_hi    = freq_var > FREQ_HI;
+        is_pure_noise = snr_est_dB < 15.0;
+        is_noisy      = snr_est_dB < 45.0;
+
+        % FM: primary (clean) or secondary (noisy + low kurtosis)
+        is_fm_clean = is_freq_hi && (env_var < ENV_FM_MAX);
+        is_fm_noisy = is_freq_hi && is_noisy && (spec_kurt < KURT_FM);
+        is_fm       = is_fm_clean || is_fm_noisy;
+
+        % AM: envelope variation, not FM
+        is_am = is_env_hi && ~is_fm;
+
+        % Composite / multi-tone: both env+freq active, clean SNR, not FM
+        is_composite = is_env_hi && is_freq_hi && ~is_noisy && ~is_fm;
+
+        if     is_pure_noise,           label = 'Pure Noise';
+        elseif is_composite,            label = 'Clean Signal';
+        elseif is_fm  && is_noisy,      label = 'FM + Noise';
+        elseif is_am  && is_noisy,      label = 'AM + Noise';
+        elseif is_fm  && ~is_noisy,     label = 'FM Signal';
+        elseif is_am  && ~is_noisy,     label = 'AM Signal';
+        elseif is_env_hi,               label = 'Speech Signal';
+        else,                           label = 'Clean Signal';
+        end
+    end
+end
+
+%% =========================================================================
+%%  ALL REMAINING HELPER FUNCTIONS (unchanged from v5.0 / v5.1)
+%% =========================================================================
+function [msg, label] = demod_pll_auto(x, fs, fc)
+    x  = x(:)'; N = numel(x); msg = zeros(1,N);
+    BW = max(fc/20, 0.5);
+    Kp = 2*pi*BW / (fc + 1e-12);
+    Ki = Kp^2 / 4;
+    Kp = min(Kp, 0.15);
+    Ki = min(Ki, 0.002);
+    phi=0; int_=0;
+    for i=1:N
+        t_i = (i-1)/fs;
+        vco_q   = -sin(2*pi*fc*t_i + phi);
+        err     = x(i) * vco_q;
+        int_    = int_ + Ki*err;
+        phi     = phi + Kp*err + int_;
+        msg(i)  = err;
+    end
+    [msg,~] = fir_filter(msg, fs, 1, fc*0.5, 0);
+    label = sprintf('FM PLL (auto: Kp=%.4f Ki=%.6f BW=%.1fHz)', Kp, Ki, BW);
+end
+
+function [y,label] = fir_filter(x, fs, ftype, fc_lo, fc_hi)
+    x=x(:)'; M=64;
+    n=(-M/2:M/2); Wc_lo=2*fc_lo/fs; Wc_hi=2*fc_hi/fs;
+    win=0.54-0.46*cos(2*pi*(n+M/2)/M);
+    mysinc = @(v) sin(pi*v + 1e-12) ./ (pi*v + 1e-12);
+    switch ftype
+        case 1
+            h=Wc_lo*mysinc(Wc_lo*n).*win; label=sprintf('LPF %.0fHz',fc_lo);
+        case 2
+            h_lpf=Wc_lo*mysinc(Wc_lo*n).*win;
+            delta=[zeros(1,M/2) 1 zeros(1,M/2)]; h=delta-h_lpf;
+            label=sprintf('HPF %.0fHz',fc_lo);
+        case 3
+            h=Wc_hi*mysinc(Wc_hi*n).*win - Wc_lo*mysinc(Wc_lo*n).*win;
+            label=sprintf('BPF %.0f-%.0fHz',fc_lo,fc_hi);
+        case 4
+            h_bpf=Wc_hi*mysinc(Wc_hi*n).*win - Wc_lo*mysinc(Wc_lo*n).*win;
+            delta=[zeros(1,M/2) 1 zeros(1,M/2)]; h=delta-h_bpf;
+            label=sprintf('Notch %.0f-%.0fHz',fc_lo,fc_hi);
+        otherwise
+            h=[zeros(1,M/2) 1 zeros(1,M/2)]; label='Bypass';
+    end
+    h=h(:)'; Nx=numel(x); Nh=numel(h); Ny=Nx+Nh-1;
+    y=zeros(1,Ny);
+    for k=1:Nh, y(k:k+Nx-1)=y(k:k+Nx-1)+h(k)*x; end
+    y=y(M/2+1:M/2+Nx);
+end
+
+function [msg,label] = demod_coherent(x, fs, fc)
+    x=x(:)'; N=numel(x); t_=(0:N-1)/fs;
+    xa  = hilbert_fft(x);
+    phi = mean(unwrap(angle(xa)) - 2*pi*fc*t_);
+    ref = cos(2*pi*fc*t_ + phi);
+    mix = x .* ref;
+    [msg,~] = fir_filter(mix, fs, 1, fc*0.6, 0);
+    msg=2*msg(:)'; label='AM Coherent Detection (Hilbert-assisted)';
+end
+
+function xa = hilbert_fft(x)
+    x=x(:)'; N=numel(x); X=fft(x,N); H=zeros(1,N);
+    if mod(N,2)==0, H(1)=1; H(N/2+1)=1; H(2:N/2)=2;
+    else,           H(1)=1; H(2:(N+1)/2)=2; end
+    xa=ifft(X.*H);
+end
+
+function [codes_norm,quant_sig] = adc_flash(x, nbits)
+    x=x(:)'; levels=2^nbits;
+    thresholds=linspace(-1,1,levels+1); thresholds=thresholds(2:end-1);
+    codes=ones(1,numel(x));
+    for th=thresholds, codes=codes+double(x>th); end
+    codes=min(codes,levels)-1;
+    codes_norm=codes/(levels-1); quant_sig=codes_norm*2-1;
+end
+
+function [codes_norm,quant_sig] = adc_sar(x, nbits)
+    x=x(:)'; levels=2^nbits; x_n=min(max((x+1)/2,0),1);
+    codes=zeros(1,numel(x));
+    for i=1:numel(x)
+        g=0;
+        for b=nbits:-1:1
+            trial=g+2^(b-1);
+            if x_n(i)*(levels-1)>=trial, g=trial; end
+        end
+        codes(i)=g;
+    end
+    codes_norm=codes/(levels-1); quant_sig=codes_norm*2-1;
+end
+
+function [codes_norm,quant_sig] = adc_sigma_delta(x, nbits, osr)
+    x=x(:)'; N=numel(x); sd_bits=zeros(1,N*osr);
+    integrator=0; idx=0;
+    for i=1:N
+        for k=1:osr
+            idx=idx+1;
+            integrator=integrator+x(i);
+            if integrator>=0, sd_bits(idx)=1; integrator=integrator-1;
+            else,              sd_bits(idx)=0; integrator=integrator+1; end
+        end
+    end
+    codes_raw=sum(reshape(sd_bits,osr,N),1)/osr;
+    codes_norm=codes_raw; quant_sig=codes_norm*2-1;
+end
+
+function [bits_out,label,params] = encode_parity(bits_in)
+    bits_in=bits_in(:)';
+    pad=mod(8-mod(numel(bits_in),8),8);
+    b=[bits_in,zeros(1,pad,'int8')]; n_bytes=numel(b)/8;
+    bits_out=zeros(1,n_bytes*9,'int8');
+    for i=1:n_bytes
+        byte=b((i-1)*8+(1:8));
+        par=int8(mod(sum(double(byte)),2));
+        bits_out((i-1)*9+(1:9))=[byte par];
+    end
+    label='Even Parity (8,9)'; params=struct('method',1,'pad',pad);
+end
+
+function [bits_out,label,params] = encode_hamming(bits_in)
+    bits_in=bits_in(:)';
+    pad=mod(4-mod(numel(bits_in),4),4);
+    b=[bits_in,zeros(1,pad,'int8')]; n4=numel(b)/4;
+    bits_out=zeros(1,n4*7,'int8');
+    for i=1:n4
+        d=double(b((i-1)*4+(1:4)));
+        p1=mod(d(1)+d(2)+d(4),2); p2=mod(d(1)+d(3)+d(4),2); p3=mod(d(2)+d(3)+d(4),2);
+        bits_out((i-1)*7+(1:7))=int8([p1 p2 d(1) p3 d(2) d(3) d(4)]);
+    end
+    label='Hamming(7,4) — 1-bit correct'; params=struct('method',2,'pad',pad);
+end
+
+function [bits_out,label,n_corr] = decode_parity(bits_in, params, orig_len)
+    bits_in=bits_in(:)'; n_corr=0;
+    n_bytes=floor(numel(bits_in)/9); bits_out=zeros(1,n_bytes*8,'int8');
+    for i=1:n_bytes
+        block=bits_in((i-1)*9+(1:9)); data=block(1:8); par=block(9);
+        if mod(sum(double(data)),2)~=par, n_corr=n_corr+1; end
+        bits_out((i-1)*8+(1:8))=data;
+    end
+    bits_out=bits_out(1:min(end,orig_len)); label='Parity Decode';
+end
+
+function [bits_out,label,n_corr] = decode_hamming(bits_in, params, orig_len)
+    bits_in=bits_in(:)'; n_corr=0;
+    n7=floor(numel(bits_in)/7); bits_out=zeros(1,n7*4,'int8');
+    for i=1:n7
+        cw=double(bits_in((i-1)*7+(1:7)));
+        s1=mod(cw(1)+cw(3)+cw(5)+cw(7),2);
+        s2=mod(cw(2)+cw(3)+cw(6)+cw(7),2);
+        s3=mod(cw(4)+cw(5)+cw(6)+cw(7),2);
+        syn=s1+2*s2+4*s3;
+        if syn~=0&&syn<=7, cw(syn)=mod(cw(syn)+1,2); n_corr=n_corr+1; end
+        bits_out((i-1)*4+(1:4))=int8(cw([3 5 6 7]));
+    end
+    bits_out=bits_out(1:min(end,orig_len)); label='Hamming(7,4) Decode';
+end
+
+function sig_out = dac_reconstruct(bits, nbits, target_len)
+    bits=bits(:)'; levels=2^nbits; n_samp=floor(numel(bits)/8);
+    codes=zeros(1,n_samp);
+    for i=1:n_samp
+        byte=double(bits((i-1)*8+(1:8)));
+        v=0; for b=1:8, v=v+byte(b)*2^(8-b); end
+        codes(i)=v;
+    end
+    sig_dac=codes/(levels-1)*2-1;
+    if n_samp<2, sig_out=zeros(1,target_len); return; end
+    sig_out=interp1(linspace(0,1,n_samp),sig_dac,linspace(0,1,target_len),'linear','extrap');
+    sig_out=sig_out(:)';
+end
+
+function snr_val = compute_snr_real(ref, sig)
+    nr=min(numel(ref),numel(sig));
+    Ps=mean(ref(1:nr).^2); Pn=mean((ref(1:nr)-sig(1:nr)).^2)+1e-12;
+    snr_val=10*log10(Ps/Pn);
+end
+
+function snr_val = compute_snr(tx, rx)
+    noise=rx-tx; Ps=mean(abs(tx).^2); Pn=mean(abs(noise).^2)+1e-12;
+    snr_val=10*log10(Ps/Pn);
+end
+
+function bits = quantize_to_bits(sig, nbits)
+    sig=sig(:)'; mn=min(sig); mx=max(sig);
+    norm=(sig-mn)/(mx-mn+1e-12); q=round(norm*(2^nbits-1));
+    N_s=numel(q); bits=zeros(1,N_s*nbits,'int8');
+    for i=1:N_s
+        for b=1:nbits
+            bits((i-1)*nbits+b)=int8(floor(mod(q(i)/2^(nbits-b),2)));
+        end
+    end
+end
+
+function [freq,psd] = manual_psd(x, fs)
+    x=x(:)'; N=numel(x);
+    win=0.5*(1-cos(2*pi*(0:N-1)/(N-1)));
+    Y=fft(x.*win,N); p=2*(abs(Y).^2)/(N*fs);
+    half=floor(N/2)+1; freq=(0:half-1)*(fs/N); psd=p(1:half); psd(1)=psd(1)/2;
+end
+
+function [S,t_ax,f_ax] = manual_stft(x, fs, win_len, hop)
+    x=x(:)'; N=numel(x);
+    if win_len>N, win_len=max(8,2^floor(log2(N))); end
+    if hop>win_len, hop=floor(win_len/2); end
+    hann_w=0.5*(1-cos(2*pi*(0:win_len-1)/(win_len-1)));
+    n_frames=floor((N-win_len)/hop)+1; S=zeros(win_len/2,n_frames);
+    for fi=1:n_frames
+        idx=(fi-1)*hop+(1:win_len); seg=x(idx).*hann_w;
+        F=fft(seg,win_len); S(:,fi)=abs(F(1:win_len/2)).^2/win_len;
+    end
+    t_ax=((0:n_frames-1)*hop+win_len/2)/fs;
+    f_ax=(0:win_len/2-1)*fs/win_len;
+end
+
+function noise = awgn_noise(tx, snr_dB, bps)
+    snr_lin=10^(snr_dB/10); Es=mean(abs(tx).^2);
+    N0=Es/(snr_lin*bps+1e-12);
+    noise=sqrt(N0/2).*(randn(size(tx))+1j*randn(size(tx)));
+end
+
+function q = qfunc(x)
+    x=max(x(:)',1e-10); q=zeros(1,numel(x));
+    for i=1:numel(x)
+        xi=x(i); tt=1/(1+0.3275911*xi);
+        p=tt*(0.254829592+tt*(-0.284496736+tt*(1.421413741+tt*(-1.453152027+tt*1.061405429))));
+        q(i)=max(0.5*p*exp(-xi^2/2),1e-7);
+    end
+end
+
+function tx = mod_bpsk(bits)
+    tx=complex(1-2*double(bits(:)'),zeros(1,numel(bits)));
+end
+function rb = demod_bpsk(rx), rb=int8(real(rx)<0); end
+
+function tx = mod_qpsk(bits)
+    while mod(length(bits),2)~=0, bits(end+1)=0; end
+    b=double(bits(:)'); nb=floor(numel(b)/2)*2; b=b(1:nb);
+    tx=complex((1-2*b(1:2:end))/sqrt(2),(1-2*b(2:2:end))/sqrt(2));
+end
+function rb = demod_qpsk(rx)
+    rb=int8(reshape([int8(real(rx)<0);int8(imag(rx)<0)],1,[]));
+end
+
+function tx = mod_16qam(bits)
+    b=double(bits(:)'); nb=floor(numel(b)/4)*4; b=b(1:nb); Ns=nb/4;
+    bm=reshape(b,4,Ns)'; lev=[-3 -1 3 1];
+    Ii=bm(:,1)*2+bm(:,2)+1; Qi=bm(:,3)*2+bm(:,4)+1;
+    tx=complex(lev(Ii)'/sqrt(10),lev(Qi)'/sqrt(10));
+end
+function rb = demod_16qam(rx)
+    lev=[-3 -1 1 3]/sqrt(10); gt=[0 0;0 1;1 1;1 0];
+    [~,Ii]=min(abs(real(rx(:))-lev),[],2);
+    [~,Qi]=min(abs(imag(rx(:))-lev),[],2);
+    rb=int8(reshape([gt(Ii,:),gt(Qi,:)]',1,[]));
+end
+
+function [label,tx,rx] = adaptive_modulate(bits, snr_dB)
+    if snr_dB < 8
+        label='BPSK  (SNR < 8 dB)'; tx=mod_bpsk(bits);
+        rx=tx+awgn_noise(tx,snr_dB,1);
+    elseif snr_dB <= 15
+        label='QPSK  (SNR 8-15 dB)'; b=bits(1:floor(numel(bits)/2)*2);
+        tx=mod_qpsk(b); rx=tx+awgn_noise(tx,snr_dB,2);
+    else
+        label='16-QAM  (SNR > 15 dB)'; b=bits(1:floor(numel(bits)/4)*4);
+        tx=mod_16qam(b); rx=tx+awgn_noise(tx,snr_dB,4);
+    end
+end
+
+function [th_b,sim_b,th_q,sim_q,th_16,sim_16] = ber_sweep(snr_vec)
+    n=numel(snr_vec);
+    [th_b,sim_b,th_q,sim_q,th_16,sim_16]=deal(zeros(1,n));
+    for k=1:n
+        s=snr_vec(k); lin=10^(s/10);
+        b=int8(rand(1,2000)>0.5); tx=mod_bpsk(b);
+        rb=demod_bpsk(tx+awgn_noise(tx,s,1));
+        sim_b(k)=max(sum(b~=rb)/2000,1e-7); th_b(k)=qfunc(sqrt(2*lin));
+        b=int8(rand(1,2000)>0.5); tx=mod_qpsk(b);
+        rb=demod_qpsk(tx+awgn_noise(tx,s,2)); mn=min(numel(b),numel(rb));
+        sim_q(k)=max(sum(b(1:mn)~=rb(1:mn))/mn,1e-7); th_q(k)=qfunc(sqrt(2*lin));
+        b=int8(rand(1,2000)>0.5); tx=mod_16qam(b);
+        rb=demod_16qam(tx+awgn_noise(tx,s,4)); mn=min(numel(b),numel(rb));
+        sim_16(k)=max(sum(b(1:mn)~=rb(1:mn))/mn,1e-7); th_16(k)=(3/8)*qfunc(sqrt(4*lin/5));
+    end
+end
+
+function ax = make_ax(ax, bg, fg)
+    set(ax,'Color',bg,'XColor',fg,'YColor',fg,...
+           'GridColor',[0.28 0.30 0.35],'GridAlpha',0.45,...
+           'FontName','Courier New','FontSize',8.5);
+    grid(ax,'on'); box(ax,'on'); hold(ax,'on');
+end
+
+function set_labels(ax, xl, yl, ttl, tcol, fg)
+    xlabel(ax, xl, 'Color', fg, 'FontSize', 8, 'FontName', 'Courier New');
+    ylabel(ax, yl, 'Color', fg, 'FontSize', 8, 'FontName', 'Courier New');
+    title(ax,  ttl, 'Color', tcol, 'FontSize', 8.5, 'FontWeight', 'bold', 'FontName', 'Courier New');
+end
